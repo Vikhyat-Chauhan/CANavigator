@@ -19,8 +19,9 @@ def main():
     # world → ROS pose bridge for entities we care about
     pose_bridge = start_pose_bridge(["drone1", "target_sphere"])
     # --- Bring up topic bridges ---
-    rosgz_bridge = start_parameter_bridge(
-        ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan")
+    rosgz_bridge = start_parameter_bridge([
+        ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan"),
+        ("/model/drone1/cmd_vel", "geometry_msgs/msg/Twist", "gz.msgs.Twist"),]
     )
 
     # body-frame velocity publisher
@@ -28,22 +29,7 @@ def main():
     ctrl.start()
 
     violation_monitor = start_violation_monitor()
-    
-
-    simple_navigator = TargetNavigator(ctrl, cfg)
-
-    try:
-        time.sleep(1.0)
-        reached = simple_navigator.go_to()
-        violations = violation_monitor.get_total()
-        print(f"[hydra] Simple Navigator result: {'reached with violations {violations}' if reached else 'timeout'}")
-    except KeyboardInterrupt:
-        pass
-    finally:
-        simple_navigator.shutdown()
-        violation_monitor.reset()
-        stop_sim(sim)
-
+    #simple_navigator = TargetNavigator(ctrl, cfg)
     lidar_navigator = LidarTargetNavigator(
         ctrl, cfg,
         goto_cfg=GoToCfgLidar(
@@ -56,35 +42,35 @@ def main():
             rate_hz=20.0,
         ),
         avoid_cfg=AvoidCfg(
-            safe_m=2.0,            # start avoiding if something is < 6 m ahead
+            safe_m=5.0,            # start avoiding if something is < 6 m ahead
             front_deg=5.0,         # central cone half-width
             side_deg=30.0,         # side cone half-width
             side_center_deg=30.0,  # side cone centers at ±30°
             turn_rate=0.2,         # rad/s while actively avoiding (capped by max_wz)
-            hysteresis_m=0.1,      # extra clearance before resuming forward
+            hysteresis_m=0.0,      # extra clearance before resuming forward
             watchdog_sec=0.6       # stop if scans go stale
         )
     )
 
     try:
-        sim = start_sim(cfg)
-        time.sleep(1.0)
+        #reached = simple_navigator.go_to()
         reached = lidar_navigator.go_to()
-        violations = violation_monitor.get_total()
-        print(f"[hydra] Lidar Navigator result: {'reached with violations {violations}' if reached else 'timeout'}")
+        violations = violation_monitor.get_total()  # returns int
+        print(f"[hydra] Simple Navigator result: {'reached with violations ' + str(violations) if reached else 'timeout'}")
     except KeyboardInterrupt:
-        pass
-    finally:
+        #simple_navigator.shutdown()
         lidar_navigator.shutdown()
         violation_monitor.reset()
         stop_sim(sim)
-
-    try:
         pose_bridge.stop()
         rosgz_bridge.stop()
-    except Exception:
-        pass
-
+    finally:
+        #simple_navigator.shutdown()
+        lidar_navigator.shutdown()
+        violation_monitor.reset()
+        stop_sim(sim)
+        pose_bridge.stop()
+        rosgz_bridge.stop()
 
 if __name__ == "__main__":
     main()

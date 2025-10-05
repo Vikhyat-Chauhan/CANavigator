@@ -1,0 +1,32 @@
+# lidar_view.rviz
+Panels:
+- Class: rviz_common/Displays
+- Class: rviz_common/Selection
+- Class: rviz_common/Tool Properties
+
+Visualization Manager:
+  Global Options:
+    Fixed Frame: drone1/X3/base_link/front_lidar
+
+  Displays:
+  - Class: rviz_default_plugins/Grid
+    Name: Grid
+    Enabled: true
+    Plane: XY
+    Cell Size: 1
+
+  - Class: rviz_default_plugins/Axes
+    Name: Drone (base_link)
+    Enabled: true
+    Reference Frame: drone1/X3/base_link
+    Length: 1.0
+    Radius: 0.03
+
+  - Class: rviz_default_plugins/LaserScan
+    Name: Front LiDAR
+    Enabled: true
+    Topic:
+      Value: /model/drone1/front_lidar/scan
+    Style: Flat Squares
+    Size (m): 0.07
+    Decay Time: 0.30

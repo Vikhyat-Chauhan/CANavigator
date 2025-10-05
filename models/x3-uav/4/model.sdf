@@ -4,15 +4,15 @@
         <link name="X3/base_link">
         <sensor name="front_lidar" type="gpu_lidar">
             <pose>0.30 0 0.20 0 0 0</pose>
-            <update_rate>15</update_rate>
+            <update_rate>20</update_rate> <!-- 10 → 20 Hz -->
             <topic>/model/drone1/front_lidar/scan</topic>
             <lidar>
                 <scan>
                     <horizontal>
-                        <samples>512</samples>
+                        <samples>1024</samples>           <!-- 512 → 1024 (finer angular grid) -->
                         <resolution>1</resolution>
-                        <min_angle>-0.785398</min_angle>   <!-- -45° -->
-                        <max_angle> 0.785398</max_angle>   <!-- +45° -->
+                        <min_angle>-2.35619</min_angle>   <!-- -135° -->
+                        <max_angle> 2.35619</max_angle>   <!-- +135° (≈270° total) -->
                     </horizontal>
                     <vertical>
                         <samples>1</samples>
@@ -22,10 +22,15 @@
                     </vertical>
                 </scan>
                 <range>
-                    <min>0.15</min>
+                    <min>0.05</min>        <!-- 0.15 → 0.05 to catch very near obstacles -->
                     <max>60.0</max>
                     <resolution>0.01</resolution>
                 </range>
+                <noise>                  <!-- add realism -->
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.01</stddev>  <!-- meters; tune 0.005–0.02 -->
+                </noise>
             </lidar>
         </sensor>
 
