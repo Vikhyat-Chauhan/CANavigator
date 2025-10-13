@@ -120,7 +120,7 @@ if [[ ! -f "$PY_OBSGEN_SCRIPT" ]]; then
   exit 1
 fi
 
-python3 "$PY_OBSGEN_SCRIPT" --pass-through --visual-alpha 0.0 --density 0.2 --corr-len 10 # <- removed --seed 1234 to randomize
+#python3 "$PY_OBSGEN_SCRIPT" --pass-through --visual-alpha 0.0 --density 0.2 --corr-len 10 # <- removed --seed 1234 to randomize
 
 echo "==> 7) Running Target Generating: $PY_TARGEN_SCRIPT"
 if [[ ! -f "$PY_TARGEN_SCRIPT" ]]; then
@@ -128,7 +128,7 @@ if [[ ! -f "$PY_TARGEN_SCRIPT" ]]; then
   exit 1
 fi
 
-python3 "$PY_TARGEN_SCRIPT" # <- removed --seed 42 to randomize
+#python3 "$PY_TARGEN_SCRIPT" # <- removed --seed 42 to randomize
 
 echo "==> 8) Running controller module"
 python3 -m "hydra_teleop.main"

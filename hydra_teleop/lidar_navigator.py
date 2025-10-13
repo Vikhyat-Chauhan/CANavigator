@@ -23,22 +23,23 @@ def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
+# Default
 @dataclass
 class GoToConfig:
-    goal_radius_m: float = 1.0
+    goal_radius_m: float = 4.0
     kp_lin: float = 0.8
     kp_z: float = 0.8
     kp_yaw: float = 1.5
-    max_v: float = 3.0
+    max_v: float = 20.0
     max_vz: float = 2.0
     max_wz: float = 0.8
     slow_yaw_threshold: float = 0.8
-    rate_hz: float = 20.0
+    rate_hz: float = 30.0
 
 @dataclass
 class AvoidCfg:
     scan_topic: str = "/model/drone1/front_lidar/scan"
-    safe_m: float = 6.0            # start avoiding if front < safe_m
+    safe_m: float = 5.0            # start avoiding if front < safe_m
     hysteresis_m: float = 1.0      # extra clearance to exit avoidance
     front_deg: float = 5.0         # front window ±deg
     side_deg: float = 30.0         # side window half-width
@@ -47,6 +48,58 @@ class AvoidCfg:
     watchdog_sec: float = 0.6      # stop if scans stale
     min_turn_sec: float = 0.7      # commit to chosen side at least this long
 
+'''
+# Fastest
+class GoToConfig:
+    goal_radius_m: float = 4.0
+    kp_lin: float = 1.2     # was 0.8  → snappier forward response
+    kp_z: float = 1.0       # was 0.8
+    kp_yaw: float = 2.0     # was 1.5
+    max_v: float = 30.0     # was 20.0 → higher top speed
+    max_vz: float = 3.5     # was 2.0
+    max_wz: float = 1.2     # was 0.8  → faster yawing
+    slow_yaw_threshold: float = 1.2  # was 0.8; keep speed even with larger yaw error
+    rate_hz: float = 60.0   # was 30.0 → more responsive control loop
+
+@dataclass
+class AvoidCfg:
+    scan_topic: str = "/model/drone1/front_lidar/scan"
+    safe_m: float = 3.0           # was 5.0 → start avoiding later
+    hysteresis_m: float = 0.8     # was 1.0
+    front_deg: float = 5.0
+    side_deg: float = 30.0
+    side_center_deg: float = 30.0
+    turn_rate: float = 1.2        # was 0.9 → quicker avoidance turns
+    watchdog_sec: float = 0.6
+    min_turn_sec: float = 0.5     # was 0.7 → commit less time per turn
+'''
+
+'''
+# Most Accurate
+@dataclass
+class GoToConfig:
+    goal_radius_m: float = 6.0   # stop earlier near goal
+    kp_lin: float = 0.6          # gentler forward response
+    kp_z: float = 0.7
+    kp_yaw: float = 1.2          # smoother heading control
+    max_v: float = 12.0          # slower top speed (was 20–30)
+    max_vz: float = 1.5
+    max_wz: float = 1.0          # adequate turn rate to steer away
+    slow_yaw_threshold: float = 0.6  # slow down for smaller yaw errors
+    rate_hz: float = 60.0        # faster loop = safer reactions
+
+@dataclass
+class AvoidCfg:
+    scan_topic: str = "/model/drone1/front_lidar/scan"
+    safe_m: float = 7.0          # start avoiding earlier (was ~5)
+    hysteresis_m: float = 2.0    # require more clearance before resuming
+    front_deg: float = 10.0      # widen frontal check
+    side_deg: float = 45.0       # larger side windows
+    side_center_deg: float = 35.0
+    turn_rate: float = 1.0       # steady turn away from obstacles
+    watchdog_sec: float = 0.4    # stop sooner if scans go stale
+    min_turn_sec: float = 1.0    # commit longer to the chosen turn
+'''
 
 class _PoseSub(Node):
     def __init__(self, topic: str, node_name: str):
@@ -74,9 +127,7 @@ class _ScanSub(Node):
             self._scan = msg
             self._t_last = time.time()
         if not self._printed:
-            self.get_logger().info(
-                f"scan: n={len(msg.ranges)} amin={msg.angle_min:.3f} "
-                f"amax={msg.angle_max:.3f} inc={msg.angle_increment:.6f}")
+            # self.get_logger().info(f"scan: n={len(msg.ranges)} amin={msg.angle_min:.3f} amax={msg.angle_max:.3f} inc={msg.angle_increment:.6f}")
             self._printed = True
     def latest(self) -> Tuple[Optional[LaserScan], float]:
         with self._lock:
@@ -112,6 +163,8 @@ class LidarTargetNavigator:
     - Go toward target
     - If blocked: stop vx and turn toward more open side
     - Commit to that turn for min_turn_sec; exit avoidance only after clearance > safe + hysteresis
+
+    go_to(...) now returns (reached: bool, elapsed_time_s: float)
     """
     def __init__(self,
                  teleop: GzTeleop,
@@ -187,23 +240,31 @@ class LidarTargetNavigator:
 
     def go_to(self,
               target_xyz: Optional[Tuple[float, float, float]] = None,
-              timeout_s: Optional[float] = None) -> bool:
+              timeout_s: Optional[float] = None) -> Tuple[bool, float]:
+        """
+        Returns:
+            reached (bool): True if goal_radius_m reached before timeout.
+            elapsed_time_s (float): Total wall-clock time spent in the loop.
+        """
         rate = max(1.0, self._gc.rate_hz)
         dt = 1.0 / rate
-        t0 = time.time()
+        t_start = time.time()
         reached = False
 
         while True:
             dpose = self._latest_drone()
             if dpose is None:
-                time.sleep(0.05); continue
+                time.sleep(0.05); 
+                if timeout_s is not None and (time.time() - t_start) > timeout_s: break
+                continue
 
             if target_xyz is None:
                 tpose = self._latest_target()
                 if tpose is None:
                     self._teleop.set_cmd(0.0, 0.0, 0.0, 0.0)
-                    if (time.time() - t0) > (timeout_s or 1e9): break
-                    time.sleep(0.05); continue
+                    if timeout_s is not None and (time.time() - t_start) > timeout_s: break
+                    time.sleep(0.05); 
+                    continue
                 tx, ty, tz = tpose
             else:
                 tx, ty, tz = target_xyz
@@ -255,7 +316,7 @@ class LidarTargetNavigator:
             # ---- send ----
             self._teleop.set_cmd(v_cmd, 0.0, vz_cmd, wz_cmd)
 
-            if timeout_s is not None and (time.time() - t0) > timeout_s:
+            if timeout_s is not None and (time.time() - t_start) > timeout_s:
                 break
 
             time.sleep(dt)
@@ -263,4 +324,5 @@ class LidarTargetNavigator:
         # stop/hold
         self._teleop.stop()
         time.sleep(max(0.05, 2.0 / self._cfg.rate_hz))
-        return reached
+        elapsed = time.time() - t_start
+        return reached, elapsed

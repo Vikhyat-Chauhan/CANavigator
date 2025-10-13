@@ -39,8 +39,8 @@ class RosGzBridge:
             for line in self._proc.stdout:
                 if self._stop_evt.is_set():
                     break
-                if line:
-                    print(f"[param-bridge:{self._proc.pid}] {line}", end="")
+                #if line:
+                    #print(f"[param-bridge:{self._proc.pid}] {line}", end="")
 
         self._reader_thread = threading.Thread(target=_reader, daemon=True)
         self._reader_thread.start()

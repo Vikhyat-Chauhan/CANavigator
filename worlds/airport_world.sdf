@@ -146,5 +146,6 @@
     <include>
       <uri>file:///home/vikhyat-chauhan/Documents/Hydra/models/generated/generated_target.sdf</uri>
     </include>
+
   </world>
 </sdf>

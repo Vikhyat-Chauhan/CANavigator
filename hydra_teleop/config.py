@@ -6,7 +6,8 @@ import os
 class TeleopConfig:
     # --- Sim / world ---
     world_path: str = "/home/vikhyat-chauhan/Documents/Hydra/worlds/airport_world.sdf"
-    sim_cmd: tuple[str, ...] = ("gz", "sim", "-r")  # world appended at runtime
+    sim_cmd: tuple[str, ...] = ("gz", "sim", "-r")  # world appended at runtime : this is GUI version
+    #sim_cmd: tuple[str, ...] = ("gz", "sim", "4", "-s", "-r")  # world appended at runtime : this is headless version
     sim_env: dict | None = None
     sim_boot_secs: float = 8.0
     launch_sim: bool = True

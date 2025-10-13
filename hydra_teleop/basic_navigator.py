@@ -27,15 +27,15 @@ def _wrap_pi(a: float) -> float:
 
 @dataclass
 class GoToConfig:
-    goal_radius_m: float = 1.0        # stop when within this 3D distance
+    goal_radius_m: float = 4.0        # stop when within this 3D distance
     kp_lin: float = 0.8               # proportional gain on planar distance
     kp_z: float = 0.8                 # proportional gain on vertical error
     kp_yaw: float = 1.5               # proportional gain on yaw error
-    max_v: float = 3.0                # linear speed cap (m/s, +x body)
+    max_v: float = 20.0                # linear speed cap (m/s, +x body)
     max_vz: float = 2.0               # vertical speed cap (m/s)
     max_wz: float = 0.8               # yaw rate cap (rad/s)
     slow_yaw_threshold: float = 0.8   # if |yaw_err| > this, reduce forward speed
-    rate_hz: float = 20.0             # control loop rate
+    rate_hz: float = 30.0             # control loop rate
 
 
 class _PoseSub(Node):
@@ -62,6 +62,8 @@ class TargetNavigator:
       - Subscribes to drone PoseStamped (default: /model/<entity>/pose/info)
       - Subscribes to target PoseStamped (default: /model/target_sphere/pose/info)
       - Commands body-frame (vx,0,vz,wz) via GzTeleop until inside goal sphere
+
+    go_to(...) returns (reached: bool, elapsed_time_s: float)
     """
 
     def __init__(self,
@@ -127,11 +129,14 @@ class TargetNavigator:
 
     def go_to(self,
               target_xyz: Optional[Tuple[float, float, float]] = None,
-              timeout_s: Optional[float] = None) -> bool:
+              timeout_s: Optional[float] = None) -> Tuple[bool, float]:
         """
         If target_xyz is None, follows the TARGET TOPIC (dynamic target).
         Otherwise, uses the provided static (x,y,z).
-        Returns True if reached goal sphere, False on timeout.
+
+        Returns:
+            reached (bool): True if goal_radius_m reached before timeout.
+            elapsed_time_s (float): Total wall-clock time spent in the loop.
         """
         rate = max(1.0, self._gc.rate_hz)
         dt = 1.0 / rate
@@ -147,6 +152,10 @@ class TargetNavigator:
             dpose = self._latest_drone()
             if dpose is None:
                 time.sleep(0.05)
+                if timeout_s is not None and (time.time() - t0) > timeout_s:
+                    self._logger.log(source="Navigator", event="timeout",
+                                     message="no drone pose")
+                    break
                 continue
 
             if target_xyz is None:
@@ -154,7 +163,7 @@ class TargetNavigator:
                 if tpose is None:
                     # no target yet; hover
                     self._teleop.set_cmd(0.0, 0.0, 0.0, 0.0)
-                    if (time.time() - t0) > (timeout_s or 1e9):
+                    if timeout_s is not None and (time.time() - t0) > timeout_s:
                         self._logger.log(source="Navigator", event="timeout",
                                          message="no target pose received")
                         break
@@ -201,4 +210,7 @@ class TargetNavigator:
         # Stop & hold zero
         self._teleop.stop()
         time.sleep(max(0.05, 2.0 / self._cfg.rate_hz))
-        return reached
+        elapsed = time.time() - t0
+        self._logger.log(source="Navigator", event="finish",
+                         message=f"reached={reached}, elapsed_s={elapsed:.3f}")
+        return reached, elapsed
