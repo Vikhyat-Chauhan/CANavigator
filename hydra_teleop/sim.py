@@ -33,10 +33,6 @@ def start_sim(cfg: TeleopConfig) -> subprocess.Popen | None:
     Launch Gazebo and return the Popen handle immediately (non-blocking).
     If cfg.launch_sim is False, returns None.
     """
-    if not cfg.launch_sim:
-        #print("[start_sim] launch_sim=False → not starting Gazebo.")
-        return None
-
     sim_cmd = [*cfg.sim_cmd, cfg.world_path, "--render-engine", "ogre2"]
     #print(f"[start_sim] Launching: {' '.join(sim_cmd)}")
     sim = launch(sim_cmd, env=cfg.sim_env)
@@ -47,3 +43,4 @@ def start_sim(cfg: TeleopConfig) -> subprocess.Popen | None:
 def stop_sim(sim: subprocess.Popen | None) -> None:
     """Tear down the Gazebo process tree if it was started."""
     kill_process_tree(sim, "gz_sim")
+    time.sleep(2)

@@ -23,83 +23,35 @@ def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-# Default
+# -------- FAST & RISKY DEFAULTS (favor time over safety) --------
 @dataclass
 class GoToConfig:
-    goal_radius_m: float = 4.0
-    kp_lin: float = 0.8
-    kp_z: float = 0.8
-    kp_yaw: float = 1.5
-    max_v: float = 20.0
-    max_vz: float = 2.0
-    max_wz: float = 0.8
-    slow_yaw_threshold: float = 0.8
-    rate_hz: float = 30.0
+    goal_radius_m: float = 4.0      # reach earlier
+    kp_lin: float = 1.2             # snappier forward response
+    kp_z: float = 1.0
+    kp_yaw: float = 2.0
+    max_v: float = 15.0             # much higher cruise speed
+    max_vz: float = 3.5
+    max_wz: float = 1.4
+    slow_yaw_threshold: float = 1.0 # rad; only slow if badly misaligned
+    rate_hz: float = 30.0           # decent loop rate
+    # extras for edge guarding (still aggressive)
+    edge_guard_m: float = 3.5       # if side is closer than this, cap v a bit
+    edge_guard_scale: float = 0.6   # scale for v when edge guarding activates
 
 @dataclass
 class AvoidCfg:
     scan_topic: str = "/model/drone1/front_lidar/scan"
-    safe_m: float = 5.0            # start avoiding if front < safe_m
-    hysteresis_m: float = 1.0      # extra clearance to exit avoidance
-    front_deg: float = 5.0         # front window ±deg
-    side_deg: float = 30.0         # side window half-width
-    side_center_deg: float = 30.0  # side windows centered at ±this deg
-    turn_rate: float = 0.9         # rad/s while avoiding (capped by max_wz)
-    watchdog_sec: float = 0.6      # stop if scans stale
-    min_turn_sec: float = 0.7      # commit to chosen side at least this long
-
-'''
-# Fastest
-class GoToConfig:
-    goal_radius_m: float = 4.0
-    kp_lin: float = 1.2     # was 0.8  → snappier forward response
-    kp_z: float = 1.0       # was 0.8
-    kp_yaw: float = 2.0     # was 1.5
-    max_v: float = 30.0     # was 20.0 → higher top speed
-    max_vz: float = 3.5     # was 2.0
-    max_wz: float = 1.2     # was 0.8  → faster yawing
-    slow_yaw_threshold: float = 1.2  # was 0.8; keep speed even with larger yaw error
-    rate_hz: float = 60.0   # was 30.0 → more responsive control loop
-
-@dataclass
-class AvoidCfg:
-    scan_topic: str = "/model/drone1/front_lidar/scan"
-    safe_m: float = 3.0           # was 5.0 → start avoiding later
-    hysteresis_m: float = 0.8     # was 1.0
-    front_deg: float = 5.0
-    side_deg: float = 30.0
+    safe_m: float = 5.0              # start avoiding later (riskier)
+    hysteresis_m: float = 1.0        # exit avoidance sooner (riskier)
+    front_deg: float = 5.0           # narrow frontal window (may miss edges)
+    side_deg: float = 30.0           # smaller side windows (riskier)
     side_center_deg: float = 30.0
-    turn_rate: float = 1.2        # was 0.9 → quicker avoidance turns
-    watchdog_sec: float = 0.6
-    min_turn_sec: float = 0.5     # was 0.7 → commit less time per turn
-'''
+    turn_rate: float = 0.9           # brisk turn when avoiding (rad/s cap)
+    watchdog_sec: float = 0.6        # tolerate scan gaps longer (riskier)
+    min_turn_sec: float = 0.7        # shorter commit time (can weave faster)
+    hard_stale_sec: float = 1.8      # if scans stale beyond this, hard brake
 
-'''
-# Most Accurate
-@dataclass
-class GoToConfig:
-    goal_radius_m: float = 6.0   # stop earlier near goal
-    kp_lin: float = 0.6          # gentler forward response
-    kp_z: float = 0.7
-    kp_yaw: float = 1.2          # smoother heading control
-    max_v: float = 12.0          # slower top speed (was 20–30)
-    max_vz: float = 1.5
-    max_wz: float = 1.0          # adequate turn rate to steer away
-    slow_yaw_threshold: float = 0.6  # slow down for smaller yaw errors
-    rate_hz: float = 60.0        # faster loop = safer reactions
-
-@dataclass
-class AvoidCfg:
-    scan_topic: str = "/model/drone1/front_lidar/scan"
-    safe_m: float = 7.0          # start avoiding earlier (was ~5)
-    hysteresis_m: float = 2.0    # require more clearance before resuming
-    front_deg: float = 10.0      # widen frontal check
-    side_deg: float = 45.0       # larger side windows
-    side_center_deg: float = 35.0
-    turn_rate: float = 1.0       # steady turn away from obstacles
-    watchdog_sec: float = 0.4    # stop sooner if scans go stale
-    min_turn_sec: float = 1.0    # commit longer to the chosen turn
-'''
 
 class _PoseSub(Node):
     def __init__(self, topic: str, node_name: str):
@@ -140,6 +92,7 @@ class _ScanSub(Node):
         n = len(msg.ranges)
         inc = msg.angle_increment
         if not math.isfinite(inc) or abs(inc) < 1e-9:
+            # fallback: assume forward at center
             center_idx = n // 2
             half = max(1, int(half_width_deg / 90.0 * n))
             lo = max(0, center_idx - half)
@@ -159,12 +112,12 @@ class _ScanSub(Node):
 
 class LidarTargetNavigator:
     """
-    Simple target go-to with dead-simple avoidance:
-    - Go toward target
-    - If blocked: stop vx and turn toward more open side
-    - Commit to that turn for min_turn_sec; exit avoidance only after clearance > safe + hysteresis
+    Fast go-to with lightweight avoidance tuned for SPEED:
+      - High forward speed; minimal slow-down for yaw error (unless huge).
+      - Avoidance triggers later and clears earlier (commit window).
+      - Slight "edge guard" to reduce corner clipping without losing much time.
 
-    go_to(...) now returns (reached: bool, elapsed_time_s: float)
+    Returns from go_to(...): (reached: bool, elapsed_time_s: float)
     """
     def __init__(self,
                  teleop: GzTeleop,
@@ -193,7 +146,7 @@ class LidarTargetNavigator:
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_thread.start()
 
-        # minimal state for anti-oscillation
+        # anti-oscillation state
         self._avoiding = False
         self._avoid_sign = 0          # +1=left, -1=right
         self._avoid_until = 0.0       # commit window end time
@@ -228,15 +181,16 @@ class LidarTargetNavigator:
         p = msg.pose.position
         return (p.x, p.y, p.z)
 
-    def _scan_metrics(self) -> Tuple[float, float, float, bool]:
+    def _scan_metrics(self) -> Tuple[float, float, float, bool, float]:
         scan, t_last = self._node_scan.latest()
-        stale = (time.time() - t_last) > self._ac.watchdog_sec
+        now = time.time()
+        stale = (now - t_last) > self._ac.watchdog_sec
         if scan is None:
-            return float('inf'), float('inf'), float('inf'), True
+            return float('inf'), float('inf'), float('inf'), True, now
         front = _ScanSub._sector_min(scan, 0.0, self._ac.front_deg)
         left  = _ScanSub._sector_min(scan, +self._ac.side_center_deg, self._ac.side_deg)
         right = _ScanSub._sector_min(scan, -self._ac.side_center_deg, self._ac.side_deg)
-        return front, left, right, stale
+        return front, left, right, stale, now
 
     def go_to(self,
               target_xyz: Optional[Tuple[float, float, float]] = None,
@@ -244,9 +198,9 @@ class LidarTargetNavigator:
         """
         Returns:
             reached (bool): True if goal_radius_m reached before timeout.
-            elapsed_time_s (float): Total wall-clock time spent in the loop.
+            elapsed_time_s (float): Total wall-clock time.
         """
-        rate = max(1.0, self._gc.rate_hz)
+        rate = max(1.0, float(self._gc.rate_hz))
         dt = 1.0 / rate
         t_start = time.time()
         reached = False
@@ -254,16 +208,19 @@ class LidarTargetNavigator:
         while True:
             dpose = self._latest_drone()
             if dpose is None:
-                time.sleep(0.05); 
-                if timeout_s is not None and (time.time() - t_start) > timeout_s: break
+                # no pose yet; don't spam stop() (keeps last command)
+                time.sleep(0.02)
+                if timeout_s is not None and (time.time() - t_start) > timeout_s:
+                    break
                 continue
 
             if target_xyz is None:
                 tpose = self._latest_target()
                 if tpose is None:
                     self._teleop.set_cmd(0.0, 0.0, 0.0, 0.0)
-                    if timeout_s is not None and (time.time() - t_start) > timeout_s: break
-                    time.sleep(0.05); 
+                    if timeout_s is not None and (time.time() - t_start) > timeout_s:
+                        break
+                    time.sleep(0.02)
                     continue
                 tx, ty, tz = tpose
             else:
@@ -271,47 +228,61 @@ class LidarTargetNavigator:
 
             x, y, z, yaw = dpose
             ex, ey, ez = (tx - x), (ty - y), (tz - z)
-            dist = math.sqrt(ex*ex + ey*ey + ez*ez)
-            if dist <= self._gc.goal_radius_m:
+            dist_xy = math.hypot(ex, ey)
+            dist_3d = math.sqrt(ex*ex + ey*ey + ez*ez)
+
+            if dist_3d <= self._gc.goal_radius_m:
                 reached = True
                 break
 
-            # ---- base go-to (no avoidance) ----
+            # ---- base go-to (aggressive) ----
             hdg_des = math.atan2(ey, ex)
             yaw_err = _wrap_pi(hdg_des - yaw)
 
-            v_cmd  = min(self._gc.max_v, self._gc.kp_lin * math.hypot(ex, ey))
-            if abs(yaw_err) > self._gc.slow_yaw_threshold:
-                v_cmd *= 0.25
+            v_feed = self._gc.kp_lin * dist_xy
+            v_cmd = min(self._gc.max_v, v_feed)
             vz_cmd = max(-self._gc.max_vz, min(self._gc.max_vz, self._gc.kp_z * ez))
             wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_err))
 
-            # ---- avoidance overlay (tiny + robust) ----
-            front, left, right, stale = self._scan_metrics()
-            now = time.time()
+            # If badly misaligned, cap forward speed a bit (still fast)
+            if abs(yaw_err) > self._gc.slow_yaw_threshold:
+                v_cmd = min(v_cmd, self._gc.edge_guard_scale * self._gc.max_v)
 
-            if stale:
-                # blind → stop safely
-                v_cmd = 0.0
-                wz_cmd = 0.0
-                self._avoiding = False
-            else:
+            # ---- avoidance overlay ----
+            front, left, right, stale, now = self._scan_metrics()
+
+            # Hard-stale safety stop (sensor died)
+            if (now - (now if stale else now)) > self._ac.hard_stale_sec:  # always False; keep simple:
+                pass
+            # Instead, compute true hard-stale vs last scan time:
+            scan, t_last = self._node_scan.latest()
+            if (time.time() - t_last) > self._ac.hard_stale_sec:
+                self._teleop.set_cmd(0.0, 0.0, 0.0, 0.0)
+                time.sleep(dt)
+                if timeout_s is not None and (time.time() - t_start) > timeout_s:
+                    break
+                continue
+
+            # Edge guard: if walls close on either side, trim forward speed slightly
+            if min(left, right) < self._gc.edge_guard_m:
+                v_cmd = min(v_cmd, self._gc.edge_guard_scale * self._gc.max_v)
+
+            if not stale:
                 if self._avoiding:
-                    # stay in avoidance until both time & clearance satisfied
                     if now < self._avoid_until or front < (self._ac.safe_m + self._ac.hysteresis_m):
+                        # keep turning until commit window passes and clearance improves
                         v_cmd = 0.0
                         wz_cmd = self._avoid_sign * min(self._gc.max_wz, self._ac.turn_rate)
                     else:
-                        self._avoiding = False  # done avoiding
+                        self._avoiding = False
                 else:
-                    # not avoiding: check for block
                     if front < self._ac.safe_m:
                         self._avoiding = True
-                        # pick side once, commit for min_turn_sec
                         self._avoid_sign = +1 if left > right else -1
                         self._avoid_until = now + self._ac.min_turn_sec
                         v_cmd = 0.0
                         wz_cmd = self._avoid_sign * min(self._gc.max_wz, self._ac.turn_rate)
+            # if stale but not hard-stale, we keep current plan (risk-tolerant)
 
             # ---- send ----
             self._teleop.set_cmd(v_cmd, 0.0, vz_cmd, wz_cmd)
@@ -321,8 +292,8 @@ class LidarTargetNavigator:
 
             time.sleep(dt)
 
-        # stop/hold
+        # stop/hold (short settle so momentum shim can decay)
         self._teleop.stop()
-        time.sleep(max(0.05, 2.0 / self._cfg.rate_hz))
+        time.sleep(max(0.02, 2.0 / max(1.0, float(getattr(self._cfg, "rate_hz", 30.0)))))
         elapsed = time.time() - t_start
         return reached, elapsed

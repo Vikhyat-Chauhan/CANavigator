@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Hydra Tool Plugin: Target (sphere) generator
+Hydra Tool Plugin: Target (sphere) generator (simple, keeps TeleopConfig dependency)
 - Picks a safe (x,y) that avoids restricted rectangles (from nofly meta)
+- Keeps a minimum distance from the drone start (from TeleopConfig or explicit cfg)
 - Writes an SDF for a static sphere + a small meta JSON
 """
 
 from dataclasses import dataclass
 from typing import Tuple, List, Optional
-import os, json, random, sys
+import os, json, random
 
 # --- Map bounds (match your world) ---
 X_MIN, X_MAX = -100.0, 100.0
@@ -34,6 +35,10 @@ class TargetGenCfg:
     margin_rect: float = 1.0
     max_tries: int = 5000  # attempts to sample a safe spot
 
+    # keep target away from drone start (optional override)
+    avoid_start_xy: Optional[Tuple[float, float]] = None  # if None, pulled from TeleopConfig
+    min_dist_start: float = 25.0  # meters of separation from start
+
     # world bounds (override if needed)
     x_min: float = X_MIN
     x_max: float = X_MAX
@@ -43,14 +48,12 @@ class TargetGenCfg:
 
 class TargetGenerator:
     """
-    Plugin-like class for generating a spherical target that avoids no-fly rectangles.
-
-    API:
-        run() -> (out_sdf, out_meta)
-        shutdown()
+    Generate a spherical target that avoids no-fly rectangles and the drone start.
+    API: run() -> (out_sdf, out_meta)
     """
 
     def __init__(self, teleop_cfg, gen_cfg: TargetGenCfg):
+        # Keep TeleopConfig dependency via this arg; we read start (x,y) from it if provided.
         self.teleop_cfg = teleop_cfg
         self.cfg = gen_cfg
 
@@ -82,26 +85,33 @@ class TargetGenerator:
             "radius": self.cfg.radius,
             "color": self.cfg.color_rgba,
             "in_meta_nofly": self.cfg.in_meta_nofly,
+            "avoid_start_xy": self._resolve_start_xy(),  # what we actually used
+            "min_dist_start": self.cfg.min_dist_start,
         }
         self._write_text(self.cfg.out_meta, json.dumps(meta, indent=2))
         return self.cfg.out_sdf, self.cfg.out_meta
 
-    def shutdown(self):
-        pass
-
     # ---------- helpers ----------
+    def _resolve_start_xy(self) -> Optional[Tuple[float, float]]:
+        """Prefer explicit cfg.avoid_start_xy; else read from TeleopConfig if available."""
+        if self.cfg.avoid_start_xy is not None:
+            return self.cfg.avoid_start_xy
+        if self.teleop_cfg is None:
+            return None
+        # Common attribute names you likely have in TeleopConfig:
+       
+        sx = getattr(self.teleop_cfg, "start_x", None)
+        sy = getattr(self.teleop_cfg, "start_y", None)
+        if sx is not None and sy is not None:
+            return (float(sx), float(sy))
+        return None
+
     @staticmethod
     def _point_in_rect_with_margin(x: float, y: float,
                                    cx: float, cy: float, w: float, h: float,
                                    margin: float = 0.0) -> bool:
-        """
-        True iff point (x,y) lies inside axis-aligned rectangle centered at (cx,cy)
-        with width w and height h, AFTER the rectangle is EXPANDED by 'margin'
-        on all sides. This lets us keep a circle of 'margin' away from the rect.
-        """
         half_w = w * 0.5 + margin
         half_h = h * 0.5 + margin
-        # Use <= (inclusive) so the sphere never touches/overlaps edges.
         return (abs(x - cx) <= half_w) and (abs(y - cy) <= half_h)
 
     def _load_restricted_rects(self, meta_path: str) -> List[Tuple[float, float, float, float]]:
@@ -134,63 +144,50 @@ class TargetGenerator:
         right  = x_max - wall_margin
         bottom = y_min + wall_margin
         top    = y_max - wall_margin
-
         if left > right or bottom > top:
             raise RuntimeError(
-                f"[hydra.tools] Sample bounds invalid after margins: "
-                f"({left},{right}) x ({bottom},{top}). "
-                f"Try reducing margin_walls or radius."
+                f"[hydra.tools] Sample bounds invalid after margins; "
+                f"reduce margin_walls or radius."
             )
 
-        # Total safety margin against rectangles must include the sphere radius.
         keepout = margin_rect + radius
+        start_xy = self._resolve_start_xy()
+        min_d2 = (self.cfg.min_dist_start ** 2) if start_xy is not None else 0.0
 
         def is_safe(px: float, py: float) -> bool:
-            # Outside all expanded rectangles?
+            # 1) outside all expanded rectangles
             for (cx, cy, w, h) in rects:
                 if self._point_in_rect_with_margin(px, py, cx, cy, w, h, keepout):
                     return False
+            # 2) far enough from start
+            if start_xy is not None:
+                dx = px - start_xy[0]
+                dy = py - start_xy[1]
+                if dx*dx + dy*dy < min_d2:
+                    return False
             return True
 
-        # 1) Rejection sampling (fast path).
+        # 1) fast rejection sampling
         for _ in range(max_tries):
             x = rnd.uniform(left, right)
             y = rnd.uniform(bottom, top)
             if is_safe(x, y):
                 return x, y
 
-        # 2) Deterministic grid sweep (no silent (0,0) fallback).
-        # Grid step ~ sphere diameter for coverage; clamp to a reasonable min.
+        # 2) simple grid sweep fallback
         step = max(2.0 * radius, 0.5)
-        # Randomize grid starting phase for variety but keep coverage.
-        x0 = left + rnd.random() * min(step, max(1e-6, right - left))
-        y0 = bottom + rnd.random() * min(step, max(1e-6, top - bottom))
-
-        xs = []
-        xg = x0
+        xg = left
         while xg <= right + 1e-9:
-            xs.append(xg)
+            yg = bottom
+            while yg <= top + 1e-9:
+                if is_safe(xg, yg):
+                    return xg, yg
+                yg += step
             xg += step
-        ys = []
-        yg = y0
-        while yg <= top + 1e-9:
-            ys.append(yg)
-            yg += step
 
-        # Optional: shuffle to avoid bias when many cells are blocked.
-        rnd.shuffle(xs)
-        rnd.shuffle(ys)
-
-        for x in xs:
-            for y in ys:
-                if is_safe(x, y):
-                    return x, y
-
-        # 3) Nothing is possible → explicit failure.
         raise RuntimeError(
-            "[hydra.tools] Could not place target: no collision-free position exists "
-            "under current rectangles, radius, and margins. "
-            "Consider reducing margin_rect/radius, shrinking no-fly areas, or enlarging the map."
+            "[hydra.tools] Could not place target: no collision-free position "
+            "satisfies rectangles, radius/margins, and min_dist_start."
         )
 
     def _make_sphere_sdf(self, name: str, radius: float,
