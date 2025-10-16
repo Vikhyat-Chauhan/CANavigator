@@ -71,7 +71,7 @@ class TeleopConfig:
     analyzer_annotate_points: bool = False
     # If True, keep runs where either strategy timed out; if False, drop them
     analyzer_include_timeouts: bool = False
-    analyzer_strategies = ["NAVALGO1", "NAVALGO2", "NAVALGO3"]
+    analyzer_strategies = ["NAVALGO1", "NAVALGO2", "NAVALGO3", "TROOP"]
 
     # =======================
     # Generated Simulation & Algo Selector
@@ -101,3 +101,56 @@ class TeleopConfig:
     n_repeats: int = 1
     timeout_s: int = 500
     time_budget_s: float | None = None  # set a number if you want a budget
+
+    # =======================
+    # Event Generator
+    # =======================
+    # Topics
+    event_topic = "/hydra/event"
+    ros_pose_topic = "/model/drone1/pose/info"
+
+    # Experiment control
+    event_auto_start = True
+    event_warmup_s = 2.0
+    event_seed = 12345
+    event_deadline_jitter_s = 0.05
+    event_default_deadline_s = 0.35
+    event_min_deadline_s = 0.12
+    event_max_deadline_s = 0.80
+
+    # Arena bounds
+    event_bounds_xy = (-100.0, 100.0, -50.0, 50.0)
+
+    # Enemy
+    event_enemy_speed_min = 1.0
+    event_enemy_speed_max = 4.0
+    event_enemy_radius_min = 1.0
+    event_enemy_radius_max = 3.0
+    event_enemy_cross_dist_ahead = 15.0
+    event_enemy_cross_lateral = 8.0
+
+    # Sudden obstacle
+    event_obstacle_radius_min = 1.0
+    event_obstacle_radius_max = 2.5
+    event_obstacle_ahead_min = 8.0
+    event_obstacle_ahead_max = 20.0
+    event_obstacle_side_span = 10.0
+
+    # Lane block
+    event_lane_w_min = 6.0
+    event_lane_w_max = 12.0
+    event_lane_h_min = 4.0
+    event_lane_h_max = 10.0
+    event_lane_ahead_min = 15.0
+    event_lane_ahead_max = 35.0
+
+    # Phases: override with a list of dicts if you want
+    event_phases = [
+        {"duration_s": 40.0, "rate_hz": 0.12, "mix_enemy": 0.6, "mix_obstacle": 0.3, "mix_lane": 0.1, "burstiness": 0.0},
+        {"duration_s": 40.0, "rate_hz": 0.20, "mix_enemy": 0.5, "mix_obstacle": 0.3, "mix_lane": 0.2, "burstiness": 0.3},
+        {"duration_s": 40.0, "rate_hz": 0.28, "mix_enemy": 0.5, "mix_obstacle": 0.2, "mix_lane": 0.3, "burstiness": 0.5},
+    ]
+
+    # Logging
+    event_log_csv_path = "events_log.csv"
+    

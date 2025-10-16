@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-# APE3 (event-aware, APE3-only):
-# - Normal loop: default navigation behavior (breadcrumbs, NFZ soft repulsion, LiDAR-aware
-#   heading chooser with corridor centering, TTC + stopping-distance, curvature-aware
-#   speed cap, jerk/accel caps, progress watchdog).
-# - Event handling (NO QUEUE):
-#     * Only the APE3 planner runs for events.
-#     * If a new event arrives while one is active → mark violation on the old,
-#       drop it, and accept the new one immediately.
-#     * If deadline expires with no applied APE3 plan → mark violation (deadline_miss).
+# TROOP (event-aware): default TROOP + Breadcrumbs + Safety shims + LiDAR-aware heading
+# + NFZ repulsion + jerk/accel caps (+ optional tiny ML risk) + deadline-aware parallel APEs
 #
 # Public API unchanged:
-#   LidarTargetNavigatorAPE3.go_to(target_xyz=None, timeout_s=None) -> (reached: bool, elapsed_s: float)
+#   LidarTargetNavigatorTROOP.go_to(target_xyz=None, timeout_s=None) -> (reached: bool, elapsed_s: float)
 
 import math, threading, time, json
 from dataclasses import dataclass
@@ -141,11 +134,16 @@ class RiskCfg:
     risk_gain_safe: float = 1.1     # safe_m *= (1 + gain*sigmoid)
     risk_gain_speed: float = 0.35   # max_v *= (1 - gain*sigmoid)
 
-# ===== Event-driven (only APE3 planner used) =====
+# ===== Event-driven selection (urgency tiers) =====
 @dataclass
 class EventDecisionCfg:
     event_topic: str = "/hydra/event"
-    # Compute budget (soft) for APE3 (wall-clock per event)
+    # Deadline tiers for which planner we aim to use
+    t_hard_s: float = 0.15   # <= this → must use APE1 (fast duck)
+    t_med_s: float = 0.40    # (t_hard, t_med] → prefer APE2; else APE3
+    # Compute budgets (soft) for planners (wall-clock per event)
+    ape1_budget_ms: int = 8
+    ape2_budget_ms: int = 30
     ape3_budget_ms: int = 80
     # Safety bumps during event handling
     safe_inflate_m: float = 1.0
@@ -247,12 +245,11 @@ class _EventSub(Node):
             return v
 
 
-class LidarTargetNavigatorAPE3:
+class LidarTargetNavigatorTROOP:
     """
-    APE3 = default navigator with APE3-only event planning.
-    - Single event active; new event preempts old with violation.
-    - Only APE3 micro-planner runs during event; if it can't resolve by deadline,
-      we log a violation and clear the event.
+    default navigator. When an event arrives, we run APE1/APE2/APE3 workers
+    in parallel and choose the best plan available by the deadline.
+    Public API and threading model remain the same as before.
     """
     def __init__(self,
                  teleop: GzTeleop,
@@ -291,7 +288,7 @@ class LidarTargetNavigatorAPE3:
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_thread.start()
 
-        # Navigation avoidance state
+        # APE1 avoidance state
         self._avoiding = False
         self._avoid_sign = 0          # +1=left, -1=right
         self._avoid_until = 0.0       # commit window end time
@@ -321,9 +318,9 @@ class LidarTargetNavigatorAPE3:
         self._evt_proposals: Dict[str, Dict] = {}
         self._evt_threads: List[threading.Thread] = []
 
-        # Single-event flags
-        self._evt_active: bool = False
-        self._evt_resolved: bool = False
+        # NEW: single-event flags
+        self._evt_active: bool = False          # exactly one active event
+        self._evt_resolved: bool = False        # did we apply an event plan before deadline?
 
     # ---------- threading ----------
     def _spin(self):
@@ -504,25 +501,52 @@ class LidarTargetNavigatorAPE3:
         vmax = math.sqrt(max(0.0, 2.0*self._rc.max_decel_mps2*(dmin - self._rc.stop_margin_m)))
         return min(v_des, vmax)
 
-    # ---------- event planner (single, APE3) ----------
+    # ---------- event planners (run in parallel per event) ----------
     def _evt_put(self, name, v, wz, vz, score):
         with self._evt_lock:
             self._evt_proposals[name] = {"v": v, "wz": wz, "vz": vz, "score": score, "ready_t": time.time()}
 
-    def _evt_plan_ape3(self, snap, budget_ms):
-        # Trajectory-aware: reuse _choose_heading + curvature cap + TTC
+    def _evt_plan_ape1(self, snap, budget_ms):
+        # Ultra-fast “duck”: pick safer side, cap speed
+        left, right = snap["left"], snap["right"]
+        v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
+        eps = self._sc.ambiguity_eps_m
+        pick_left = (left > right) if abs(left-right) >= eps else (self._side_bias > 0)
+        wz_cmd += (+0.9 if pick_left else -0.9)
+        v_cmd = min(v_cmd, 0.35 * self._gc.max_v)
+        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=0.0)
+
+    def _evt_plan_ape2(self, snap, budget_ms):
+        # Local opening: sweep wider, moderate speed
         t0 = time.time()
         scan = snap["scan"]
-        if (time.time() - t0)*1000.0 > budget_ms:
-            return self._evt_put("APE3", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
+        if scan is None:
+            return self._evt_put("APE2", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
+        best_deg, best_r = 0.0, -1.0
+        for deg in range(-70, 71, 2):
+            r = self._range_at(scan, deg, 2.0)
+            if math.isfinite(r) and r > best_r:
+                best_r, best_deg = r, deg
+            if (time.time() - t0)*1000.0 > budget_ms:
+                break
+        hdr = math.radians(best_deg)
+        yaw_goal = _wrap_pi(hdr)
+        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
+        v = min(snap["v_cmd"], 0.45 * self._gc.max_v)
+        score = - (best_r - 0.5*abs(wz))  # larger clearance & smaller |wz| better
+        self._evt_put("APE2", v, wz, snap["vz_cmd"], score)
+
+    def _evt_plan_ape3(self, snap, budget_ms):
+        # Trajectory-aware: reuse _choose_heading + curvature cap + TTC
+        scan = snap["scan"]
         if scan is None:
             return self._evt_put("APE3", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
-
         yaw_err = snap["yaw_err"]; x = snap["x"]; y = snap["y"]
         hdr = self._choose_heading(scan, yaw_err, x, y)
         wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * _wrap_pi(hdr)))
         v = min(snap["v_cmd"], self._gc.max_v / (1.0 + self._rc.curvature_k * abs(wz)))
         # forward window for TTC
+        dmin = float('inf')
         window = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
         dmin = min(window) if window else float('inf')
         v = self._stopping_limited_speed(v, dmin)
@@ -530,10 +554,11 @@ class LidarTargetNavigatorAPE3:
         score = - (1.0*s_clear - 0.4*abs(wz))
         self._evt_put("APE3", v, wz, snap["vz_cmd"], score)
 
-    # ---------- event helpers ----------
+    # ---------- event helpers (new) ----------
     def _evt_violate(self, reason: str = "miss"):
         """Record a violation for the currently active event (if any)."""
-        if self._pending_evt is None: return
+        if self._pending_evt is None:
+            return
         try:
             kind = self._pending_evt.get("kind", "?")
             dl   = float(self._pending_evt.get("deadline_s", 0.0))
@@ -603,24 +628,28 @@ class LidarTargetNavigatorAPE3:
             # ---------- Scan & metrics ----------
             front, left, right, stale, scan, now = self._scan_metrics()
 
-            # ---- Event intake: if active, violate & replace; else start APE3 only ----
+            # ---- Event intake: if active, violate & replace; else start new ----
             evt = self._node_evt.pop()
             if evt is not None:
+                # If an event is already active → mark violation on the old one, drop it, accept the new one
                 if self._evt_active:
                     self._evt_violate("preempted_by_new_event")
                     self._evt_clear()
 
+                # Activate the new event
                 self._pending_evt = evt
                 self._evt_deadline_at = evt["t_recv"] + max(0.0, float(evt.get("deadline_s", 0.0)))
                 self._evt_active = True
                 self._evt_resolved = False
 
+                # clear old proposals and threads (safety)
                 with self._evt_lock:
                     self._evt_proposals = {}
                 for t in self._evt_threads:
                     if t.is_alive(): t.join(timeout=0.001)
                 self._evt_threads = []
 
+                # Snapshot deterministic state
                 snap = {
                     "x": x, "y": y, "z": z, "yaw": yaw,
                     "tx": tx, "ty": ty, "tz": tz,
@@ -630,7 +659,10 @@ class LidarTargetNavigatorAPE3:
                     "yaw_err": _wrap_pi(math.atan2(ey, ex) - yaw),
                 }
 
+                # Fire one-shot planners in parallel (no queue, no retries)
                 self._evt_threads = [
+                    threading.Thread(target=self._evt_plan_ape1, args=(snap, self._edc.ape1_budget_ms), daemon=True),
+                    threading.Thread(target=self._evt_plan_ape2, args=(snap, self._edc.ape2_budget_ms), daemon=True),
                     threading.Thread(target=self._evt_plan_ape3, args=(snap, self._edc.ape3_budget_ms), daemon=True),
                 ]
                 for t in self._evt_threads: t.start()
@@ -698,27 +730,48 @@ class LidarTargetNavigatorAPE3:
 
             max_v_risk_cap = self._gc.max_v * (1.0 - self._rc.risk_gain_speed * risk)
 
-            # ---------- Event window: safety bump + use APE3 if ready by deadline ----------
+            # ---------- Event window: safety bump + choose best-ready plan ----------
             if event_active:
+                # temporary safety & speed caps during event handling
                 effective_safe_m += self._edc.safe_inflate_m
                 v_cmd = min(v_cmd, self._edc.v_cap_frac * self._gc.max_v)
 
                 tl = _evt_time_left()
+
+                # If deadline passed and we never applied an event plan -> violation
                 if tl <= 0.0:
                     if not self._evt_resolved:
                         self._evt_violate("deadline_miss")
+                    # Clear either way (resolved or missed)
                     self._evt_clear()
                 else:
+                    # Choose target APE by time-left
+                    target_name = "APE3" if tl > self._edc.t_med_s else ("APE2" if tl > self._edc.t_hard_s else "APE1")
+
                     with self._evt_lock:
                         ready = dict(self._evt_proposals)
-                    prop = ready.get("APE3", None)
-                    if prop is not None:
+
+                    order = {
+                        "APE3": ["APE3", "APE2", "APE1"],
+                        "APE2": ["APE2", "APE1"],
+                        "APE1": ["APE1"]
+                    }[target_name]
+
+                    chosen = None
+                    for name in order:
+                        if name in ready:
+                            chosen = (name, ready[name])
+                            break
+
+                    if chosen is not None:
+                        _, prop = chosen
                         v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
+                        # Mark as resolved the first time we actually apply a plan
                         if not self._evt_resolved:
                             self._evt_resolved = True
                             try:
                                 kind = self._pending_evt.get("kind", "?")
-                                self._logger.info(f"[EVENT RESOLVED] kind={kind} by APE3 with {tl:.3f}s left")
+                                self._logger.info(f"[EVENT RESOLVED] kind={kind} by {chosen[0]} with {tl:.3f}s left")
                             except Exception:
                                 pass
 
@@ -777,7 +830,7 @@ class LidarTargetNavigatorAPE3:
                     sgn = 1.0 if corr_skew > 0.0 else -1.0
                     wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, wz_cmd + 0.5*sgn))
 
-                # TTC map + stopping distance
+                # TTC map
                 if v_cmd > 0.05 and math.isfinite(dmin) and dmin > 0.0:
                     ttc = dmin / max(v_cmd, 1e-3)
                     if ttc < self._sc.ttc_soft_s:
@@ -787,7 +840,7 @@ class LidarTargetNavigatorAPE3:
                         v_cmd = self._gc.max_v * frac
                     v_cmd = self._stopping_limited_speed(v_cmd, dmin)
 
-            # Curvature-aware speed cap + risk cap
+            # Curvature-aware speed cap (slow down when |wz| is high) + risk cap
             v_cmd = min(v_cmd, max_v_risk_cap)
             v_cmd = min(v_cmd, self._gc.max_v / (1.0 + self._rc.curvature_k * abs(wz_cmd)))
 
@@ -817,13 +870,15 @@ class LidarTargetNavigatorAPE3:
             base_dv_max = self._sc.dv_max_mps_per_s * dt
             dwz_max = self._sc.jw_max_radps2 * dt
 
+            # Detect "empty heading": big clearance ahead & small yaw demand
             empty_heading = (
                 (not self._avoiding) and
                 math.isfinite(dmin) and dmin >= self._sc.clear_ahead_thresh_m and
                 abs(wz_cmd) <= self._sc.yaw_align_rad
             )
+
             dv_up_max = base_dv_max * (self._sc.dv_clear_scale if empty_heading else 1.0)
-            dv_down_max = base_dv_max * 1.5  # stronger braking
+            dv_down_max = base_dv_max * 1.5  # braking can remain stronger
 
             if v_cmd > self._v_cmd_prev:
                 v_cmd = min(self._v_cmd_prev + dv_up_max, v_cmd)
