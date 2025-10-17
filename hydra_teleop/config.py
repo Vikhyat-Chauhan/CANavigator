@@ -23,10 +23,7 @@ class TeleopConfig:
     yaw_rate: float = 0.8
 
     # --- Logging ---
-    log_to_csv: bool = False
-    log_dir: str = "logs"
-    log_name: str = "teleop"
-    log_headers: list[str] | None = None
+    log_path: str = "logs/run_logs.json"
 
     def __post_init__(self):
         if self.sim_env is None:
@@ -55,10 +52,7 @@ class TeleopConfig:
     # =======================
 
     # Where main experiment writes the consolidated results CSV:
-    results_csv_path: str = "logs/results/hydra_results.csv"
-
-    # Whether to automatically run the analyzer after main finishes:
-    run_analyzer_after: bool = True
+    results_csv_path: str = "logs/results/experiment_summary.csv"
 
     # Analyzer output directory (plots + summaries will go here):
     analyzer_out_dir: str = "logs/results"
@@ -70,8 +64,8 @@ class TeleopConfig:
     # Plot toggles
     analyzer_annotate_points: bool = False
     # If True, keep runs where either strategy timed out; if False, drop them
-    analyzer_include_timeouts: bool = False
-    analyzer_strategies = ["NAVALGO1", "NAVALGO2", "NAVALGO3", "TROOP"]
+    analyzer_include_timeouts: bool = True
+    analyzer_strategies = ["APE1", "APE2", "APE3", "TROOP"]
 
     # =======================
     # Generated Simulation & Algo Selector
@@ -109,15 +103,21 @@ class TeleopConfig:
     event_topic = "/hydra/event"
     ros_pose_topic = "/model/drone1/pose/info"
 
-    # Experiment control
-    event_auto_start = True
-    event_warmup_s = 2.0
-    event_seed = 12345
-    event_deadline_jitter_s = 0.05
-    event_default_deadline_s = 0.35
-    event_min_deadline_s = 0.12
-    event_max_deadline_s = 0.80
+    # Reproducibility (optional)
+    event_seed = 42
 
+    # Deadlines — tight & clamped (CLAMP IS ENABLED in your emitter)
+    event_deadline_scale = 0.62   # global squeeze; makes everyone work harder
+    event_deadline_jitter_s = 0.03
+    event_default_deadline_s = 0.16
+    event_min_deadline_s = 0.09
+    event_max_deadline_s = 0.60
+
+    # Per-kind deadlines (hardest first)
+    # Lane & Obstacle are intentionally tighter → APE3 struggles most here.
+    event_lane_deadline_s     = 0.12
+    event_obstacle_deadline_s = 0.13
+    event_enemy_deadline_s    = 0.18   # a bit more forgiving
     # Arena bounds
     event_bounds_xy = (-100.0, 100.0, -50.0, 50.0)
 
@@ -144,11 +144,23 @@ class TeleopConfig:
     event_lane_ahead_min = 15.0
     event_lane_ahead_max = 35.0
 
-    # Phases: override with a list of dicts if you want
+    # Phases — increasing arrival rate + burstiness so late windows are toughest.
+    # Mix leans a bit toward LANE_BLOCK (hardest) and keeps some OBSTACLE.
     event_phases = [
-        {"duration_s": 40.0, "rate_hz": 0.12, "mix_enemy": 0.6, "mix_obstacle": 0.3, "mix_lane": 0.1, "burstiness": 0.0},
-        {"duration_s": 40.0, "rate_hz": 0.20, "mix_enemy": 0.5, "mix_obstacle": 0.3, "mix_lane": 0.2, "burstiness": 0.3},
-        {"duration_s": 40.0, "rate_hz": 0.28, "mix_enemy": 0.5, "mix_obstacle": 0.2, "mix_lane": 0.3, "burstiness": 0.5},
+        # Warm-ish: mostly solvable for APE1/APE2; APE3 starts to miss.
+        {"duration_s": 40.0, "rate_hz": 0.14,
+        "mix_enemy": 0.30, "mix_obstacle": 0.30, "mix_lane": 0.40,
+        "burstiness": 0.00},
+
+        # Harder: more arrivals + mild burst clusters → more tight overlaps.
+        {"duration_s": 40.0, "rate_hz": 0.22,
+        "mix_enemy": 0.28, "mix_obstacle": 0.30, "mix_lane": 0.42,
+        "burstiness": 0.30},
+
+        # Spicy: high rate + burstiness → many deadlines tight while planning.
+        {"duration_s": 40.0, "rate_hz": 0.30,
+        "mix_enemy": 0.25, "mix_obstacle": 0.30, "mix_lane": 0.45,
+        "burstiness": 0.55},
     ]
 
     # Logging

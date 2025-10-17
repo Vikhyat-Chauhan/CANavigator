@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# APE1 (event-aware, APE1-only variant for events):
-# - Baseline navigation (breadcrumbs + safety + LiDAR-aware heading + NFZ repulsion + jerk/accel caps)
-# - Event handling simplified: ONLY APE1 is used, and ONLY when the event is in APE1 tier (time-left <= t_hard_s)
+# TROOP (event-aware): default TROOP + Breadcrumbs + Safety shims + LiDAR-aware heading
+# + NFZ repulsion + jerk/accel caps (+ optional tiny ML risk) + deadline-aware parallel APEs
 #
-# Public API:
-#   LidarTargetNavigatorAPE1.go_to(target_xyz=None, timeout_s=None) -> (reached: bool, elapsed_s: float)
+# Public API unchanged:
+#   LidarTargetNavigatorTROOP.go_to(target_xyz=None, timeout_s=None) -> (reached: bool, elapsed_s: float)
 
 import math, threading, time, json
 from dataclasses import dataclass
@@ -18,11 +17,24 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
-from .teleop import GzTeleop
-from .logger import Logger
-from .config import TeleopConfig
+from hydra_teleop.teleop import GzTeleop
+from hydra_teleop.config import TeleopConfig
+import logging
 
-
+#-------- loggin template --------
+'''
+    self._logger.info({
+                        "kind" : "ENEMY"|"WALL"|"ETC",
+                            "outcome" : "RESOLVED",|"VIOLATION",
+                            "reason" : "SUCCESS"|"PREMPTIVE",|"TIMEOUT",
+                            "resolver" : "APE1"|"APE2"|"APE3",
+                            "time_left" : round(dl, 3),
+                            "deadline" : round(dl, 3)
+                            }
+                        extra = {
+                            "type" : "EVENT"|"NAVIGATION"
+                        })               
+'''   
 # ---------- small math ----------
 def _yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
     t0 = +2.0 * (w * z + x * y)
@@ -52,15 +64,15 @@ class GoToConfig:
 @dataclass
 class AvoidCfg:
     scan_topic: str = "/model/drone1/front_lidar/scan"
-    safe_m: float = 5.0
-    hysteresis_m: float = 1.0
-    front_deg: float = 5.0
-    side_deg: float = 30.0
-    side_center_deg: float = 30.0
-    turn_rate: float = 0.9
-    watchdog_sec: float = 0.6
-    hard_stale_sec: float = 1.8
-    min_turn_sec: float = 0.7
+    safe_m: float = 5.0            # start avoiding if front < safe_m
+    hysteresis_m: float = 1.0      # extra clearance to exit avoidance
+    front_deg: float = 5.0         # front window ±deg
+    side_deg: float = 30.0         # side window half-width
+    side_center_deg: float = 30.0  # side windows centered at ±this deg
+    turn_rate: float = 0.9         # rad/s while avoiding (capped by max_wz)
+    watchdog_sec: float = 0.6      # soft stale threshold
+    hard_stale_sec: float = 1.8    # hard stale -> brake
+    min_turn_sec: float = 0.7      # commit to chosen side at least this long
 
 # ===== Breadcrumbs (minimal) =====
 @dataclass
@@ -72,51 +84,81 @@ class BreadcrumbCfg:
 # ===== Safety / reliability =====
 @dataclass
 class SafetyCfg:
-    ambiguity_eps_m: float = 0.5
-    ttc_soft_s: float = 2.0
-    ttc_hard_s: float = 1.0
-    v_min_frac: float = 0.15
+    # Use crumbs ONLY when tie/near-tie
+    ambiguity_eps_m: float = 0.5     # |left-right| < eps => ambiguous
+
+    # TTC braking (distance / forward_speed)
+    ttc_soft_s: float = 2.0          # start slowing under this TTC
+    ttc_hard_s: float = 1.0          # hard clamp under this TTC
+    v_min_frac: float = 0.15         # never go below this * max_v (unless escaping)
+
+    # Cap turn-rate when any obstacle is close
     near_obs_m: float = 3.0
     cap_wz_near_obs: float = 0.8
+
+    # Corner guard: when heading change is sharp, inflate safe distance
     corner_deg: float = 30.0
-    corner_inflate_m: float = 1.5
+    corner_inflate_m: float = 1.5    # extra meters added to safe_m when sharp
+
+    # Progress watchdog
     progress_window_s: float = 3.0
     min_progress_m: float = 1.0
     escape_yaw_rad: float = 0.8
     escape_time_s: float = 0.8
+
+    # Oscillation detection → flip bias
     crumb_oscillations_to_flip: int = 12
-    dv_max_mps_per_s: float = 8.0
-    jw_max_radps2: float = 2.5
-    clear_ahead_thresh_m: float = 12.0
-    dv_clear_scale: float = 0.5
-    yaw_align_rad: float = 0.25
+
+    # Command shaping (prevents “launch into wall”)
+    dv_max_mps_per_s: float = 8.0    # base cap on linear speed change rate
+    jw_max_radps2: float = 2.5       # cap on yaw-rate change per second
+
+    # Gentler accel when heading is “empty” (clear & aligned)
+    clear_ahead_thresh_m: float = 12.0  # forward clearance considered "empty"
+    dv_clear_scale: float = 0.5         # fraction of normal accel when empty
+    yaw_align_rad: float = 0.25         # slow accel if |wz_cmd| <= this
 
 # ===== LiDAR-aware & ML risk tuning (optional) =====
 @dataclass
 class RiskCfg:
+    # Vehicle / physics for stopping-distance rule
     vehicle_radius_m: float = 0.7
     max_decel_mps2: float = 6.0
     stop_margin_m: float = 1.0
-    gate_half_deg: float = 12.0
-    center_weight: float = 0.6
-    align_weight: float = 0.8
-    sweep_max_deg: float = 60.0
-    sweep_step_deg: float = 2.5
-    arc_check_m: float = 4.0
-    nofly_min_dist_m: float = 3.0
-    nofly_soft_w: float = 6.0
-    nofly_repulse_gain: float = 2.0
-    curvature_k: float = 0.9
-    risk_json_path: Optional[str] = None
-    risk_gain_safe: float = 1.1
-    risk_gain_speed: float = 0.35
 
-# ===== Event decisions (we only use t_hard_s here) =====
+    # Corridor / doorway logic
+    gate_half_deg: float = 12.0     # +/- sector to estimate “doorway” width
+    center_weight: float = 0.6      # bias to keep centered in corridor
+    align_weight: float = 0.8       # prefer headings that reduce yaw_err
+    sweep_max_deg: float = 60.0     # scan heading candidates in [-this,+this]
+    sweep_step_deg: float = 2.5
+    arc_check_m: float = 4.0        # min clearance along short arc
+
+    # No-fly boundary soft-penalty (optional; provide rectangles on cfg)
+    nofly_min_dist_m: float = 3.0   # keep at least this much
+    nofly_soft_w: float = 6.0       # weight for soft 1/(d+eps) cost
+    nofly_repulse_gain: float = 2.0 # repulsion vector strength
+
+    # Curvature-aware speed scaling
+    curvature_k: float = 0.9        # higher => slower on high yaw demand
+
+    # ML risk scaler (optional)
+    risk_json_path: Optional[str] = None  # JSON: {"w":[...]} logistic weights
+    risk_gain_safe: float = 1.1     # safe_m *= (1 + gain*sigmoid)
+    risk_gain_speed: float = 0.35   # max_v *= (1 - gain*sigmoid)
+
+# ===== Event-driven selection (urgency tiers) =====
 @dataclass
 class EventDecisionCfg:
     event_topic: str = "/hydra/event"
-    t_hard_s: float = 0.15   # If time-left <= this, activate APE1
-    # (Other fields from full version not needed here, but we keep speed/safety bumps)
+    # Deadline tiers for which planner we aim to use
+    t_hard_s: float = 0.15   # <= this → must use APE1 (fast duck)
+    t_med_s: float = 0.40    # (t_hard, t_med] → prefer APE2; else APE3
+    # Compute budgets (soft) for planners (wall-clock per event)
+    ape1_budget_ms: int = 8
+    ape2_budget_ms: int = 25
+    ape3_budget_ms: int = 80
+    # Safety bumps during event handling
     safe_inflate_m: float = 1.0
     v_cap_frac: float = 0.60
 
@@ -215,14 +257,11 @@ class _EventSub(Node):
             self._pending = None
             return v
 
-
-class LidarTargetNavigatorAPE1:
+class LidarTargetNavigatorTROOP:
     """
-    Baseline navigator + APE1-only event handler:
-    - Run baseline navigation behaviors continuously.
-    - On event: if time-left <= t_hard_s, apply a one-shot APE1 reaction immediately.
-      Otherwise ignore the event (no queueing).
-    - If a new event arrives while one is active, mark violation on the old one and accept the new one.
+    default navigator. When an event arrives, we run APE1/APE2/APE3 workers
+    in parallel and choose the best plan available by the deadline.
+    Public API and threading model remain the same as before.
     """
     def __init__(self,
                  teleop: GzTeleop,
@@ -233,8 +272,7 @@ class LidarTargetNavigatorAPE1:
                  avoid_cfg: Optional[AvoidCfg] = None,
                  crumb_cfg: Optional[BreadcrumbCfg] = None,
                  safety_cfg: Optional[SafetyCfg] = None,
-                 risk_cfg: Optional[RiskCfg] = None,
-                 logger: Optional[Logger] = None):
+                 risk_cfg: Optional[RiskCfg] = None,):
         self._teleop = teleop
         self._cfg = cfg
         self._gc = goto_cfg or GoToConfig()
@@ -242,7 +280,7 @@ class LidarTargetNavigatorAPE1:
         self._bc = crumb_cfg or BreadcrumbCfg()
         self._sc = safety_cfg or SafetyCfg()
         self._rc = risk_cfg or RiskCfg()
-        self._logger = logger or Logger(cfg)
+        self._logger = logging.getLogger(__name__)
 
         entity = getattr(cfg, "entity_name", "drone1")
         drone_topic = drone_pose_topic or getattr(cfg, "ros_pose_topic", f"/model/{entity}/pose/info")
@@ -263,10 +301,10 @@ class LidarTargetNavigatorAPE1:
 
         # APE1 avoidance state
         self._avoiding = False
-        self._avoid_sign = 0
-        self._avoid_until = 0.0
+        self._avoid_sign = 0          # +1=left, -1=right
+        self._avoid_until = 0.0       # commit window end time
 
-        # Breadcrumbs
+        # Breadcrumbs: O(1) membership + FIFO pruning
         self._crumb_set: Set[Tuple[int,int,int]] = set()
         self._crumb_fifo: Deque[Tuple[int,int,int]] = deque()
         self._side_bias: int = +1
@@ -284,11 +322,16 @@ class LidarTargetNavigatorAPE1:
         self._v_cmd_prev = 0.0
         self._wz_cmd_prev = 0.0
 
-        # Event state (no queue)
+        # Event state
         self._pending_evt: Optional[Dict] = None
         self._evt_deadline_at: float = 0.0
-        self._evt_active: bool = False
-        self._evt_resolved: bool = False
+        self._evt_lock = threading.Lock()
+        self._evt_proposals: Dict[str, Dict] = {}
+        self._evt_threads: List[threading.Thread] = []
+
+        # single-event flags
+        self._evt_active: bool = False          # exactly one active event
+        self._evt_resolved: bool = False        # did we apply an event plan before deadline?
 
     # ---------- threading ----------
     def _spin(self):
@@ -377,20 +420,27 @@ class LidarTargetNavigatorAPE1:
             yield x
             x += step
 
+    def _sweep_candidates(self, scan: LaserScan) -> List[float]:
+        step = max(0.5, float(self._rc.sweep_step_deg))
+        M = max(5.0, float(self._rc.sweep_max_deg))
+        return [d for d in self._frange(-M, +M, step)]
+
     def _range_at(self, scan: LaserScan, center_deg: float, half_w_deg: float=2.0) -> float:
         return _ScanSub._sector_min(scan, center_deg, half_w_deg)
 
     def _gap_metrics(self, scan: LaserScan) -> Tuple[float, float]:
+        """Approximate corridor width & skew near forward using ±gate_half_deg."""
         L = self._range_at(scan, +self._rc.gate_half_deg, half_w_deg=2.0)
         R = self._range_at(scan, -self._rc.gate_half_deg, half_w_deg=2.0)
-        width = (L + R)
-        skew  = (L - R)
+        width = (L + R)  # crude proxy for opening width
+        skew  = (L - R)  # >0 => more space on left
         if not math.isfinite(width): width = float('inf')
         if not math.isfinite(skew):  skew = 0.0
         return width, skew
 
     # ---------- No-fly helpers ----------
     def _nofly_rects(self):
+        # Optional: supply rectangles via cfg.nofly_rects_xywh = [(cx,cy,w,h), ...]
         return getattr(self._cfg, "nofly_rects_xywh", None) or []
 
     def _min_dist_nofly(self, x: float, y: float) -> float:
@@ -404,6 +454,7 @@ class LidarTargetNavigatorAPE1:
         return best
 
     def _nfz_repulsion_vec(self, x: float, y: float) -> Tuple[float, float, float]:
+        """Return (fx, fy, soft_cost) from no-fly rectangles. soft_cost ~ sum 1/(d+eps)."""
         rects = self._nofly_rects()
         if not rects: return 0.0, 0.0, 0.0
         eps = 0.5
@@ -421,27 +472,127 @@ class LidarTargetNavigatorAPE1:
                 fy += (dy_out / d) / (d + eps)
         return fx, fy, cost
 
-    # ---------- APE1 one-shot event planner ----------
-    def _evt_apply_ape1(self, v_cmd: float, wz_cmd: float, vz_cmd: float, left: float, right: float):
-        """Ultra-fast 'duck' reaction: pick safer side, small yaw push, speed cap."""
+    # ---------- arc safety check ----------
+    def _arc_is_clear(self, scan: LaserScan, deg: float, arc_m: float) -> bool:
+        r = self._range_at(scan, deg, half_w_deg=2.0)
+        return (not math.isfinite(r)) or (r >= arc_m)
+
+    def _choose_heading(self, scan: LaserScan, yaw_err: float, x: float, y: float) -> float:
+        """
+        Multi-term heading score around forward:
+            score = range(θ)
+                  - center_weight * |skew at θ|
+                  - align_weight   * |θ - yaw_err_deg|
+                  - nofly_soft_w   * NFZ_soft_cost (at current pose)
+        with an arc clearance check to veto unsafe θ.
+        Returns desired heading offset (rad) relative to forward.
+        """
+        yaw_err_deg = math.degrees(yaw_err)
+        best = 0.0
+        best_score = -1e18
+        _, _, nfz_soft0 = self._nfz_repulsion_vec(x, y)
+
+        for deg in self._sweep_candidates(scan):
+            if not self._arc_is_clear(scan, deg, self._rc.arc_check_m):
+                continue
+            r = self._range_at(scan, deg, half_w_deg=2.0)
+            if not math.isfinite(r): r = 0.0
+            l = self._range_at(scan, deg + self._rc.gate_half_deg, 2.0)
+            rr = self._range_at(scan, deg - self._rc.gate_half_deg, 2.0)
+            skew = abs(l - rr) if (math.isfinite(l) and math.isfinite(rr)) else 0.0
+            score = r - self._rc.center_weight*skew - self._rc.align_weight*abs(deg - yaw_err_deg) - self._rc.nofly_soft_w*nfz_soft0
+            if score > best_score:
+                best_score, best = score, deg
+        return math.radians(best)
+
+    def _stopping_limited_speed(self, v_des: float, dmin: float) -> float:
+        """Enforce v^2/(2a) + margin <= dmin."""
+        if not math.isfinite(dmin) or dmin <= self._rc.stop_margin_m:
+            return 0.0
+        vmax = math.sqrt(max(0.0, 2.0*self._rc.max_decel_mps2*(dmin - self._rc.stop_margin_m)))
+        return min(v_des, vmax)
+
+    # ---------- event planners (run in parallel per event) ----------
+    def _evt_put(self, name, v, wz, vz, score):
+        with self._evt_lock:
+            self._evt_proposals[name] = {"v": v, "wz": wz, "vz": vz, "score": score, "ready_t": time.time()}
+
+    def _evt_plan_ape1(self, snap, budget_ms):
+        # Ultra-fast “duck”: pick safer side, cap speed
+        left, right = snap["left"], snap["right"]
+        v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
         eps = self._sc.ambiguity_eps_m
-        pick_left = (left > right) if abs(left - right) >= eps else (self._side_bias > 0)
+        pick_left = (left > right) if abs(left-right) >= eps else (self._side_bias > 0)
         wz_cmd += (+0.9 if pick_left else -0.9)
         v_cmd = min(v_cmd, 0.35 * self._gc.max_v)
-        return v_cmd, wz_cmd, vz_cmd
+        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=0.0)
+
+    def _evt_plan_ape2(self, snap, budget_ms):
+        # Local opening: sweep wider, moderate speed
+        t0 = time.time()
+        scan = snap["scan"]
+        if scan is None:
+            return self._evt_put("APE2", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
+        best_deg, best_r = 0.0, -1.0
+        for deg in range(-70, 71, 2):
+            r = self._range_at(scan, deg, 2.0)
+            if math.isfinite(r) and r > best_r:
+                best_r, best_deg = r, deg
+            if (time.time() - t0)*1000.0 > budget_ms:
+                break
+        hdr = math.radians(best_deg)
+        yaw_goal = _wrap_pi(hdr)
+        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
+        v = min(snap["v_cmd"], 0.45 * self._gc.max_v)
+        score = - (best_r - 0.5*abs(wz))  # larger clearance & smaller |wz| better
+        self._evt_put("APE2", v, wz, snap["vz_cmd"], score)
+
+    def _evt_plan_ape3(self, snap, budget_ms):
+        # Trajectory-aware: reuse _choose_heading + curvature cap + TTC
+        scan = snap["scan"]
+        if scan is None:
+            return self._evt_put("APE3", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
+        yaw_err = snap["yaw_err"]; x = snap["x"]; y = snap["y"]
+        hdr = self._choose_heading(scan, yaw_err, x, y)
+        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * _wrap_pi(hdr)))
+        v = min(snap["v_cmd"], self._gc.max_v / (1.0 + self._rc.curvature_k * abs(wz)))
+        # forward window for TTC
+        dmin = float('inf')
+        window = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
+        dmin = min(window) if window else float('inf')
+        v = self._stopping_limited_speed(v, dmin)
+        s_clear = (dmin if math.isfinite(dmin) else 0.0)
+        score = - (1.0*s_clear - 0.4*abs(wz))
+        self._evt_put("APE3", v, wz, snap["vz_cmd"], score)
 
     # ---------- event helpers ----------
     def _evt_violate(self, reason: str = "miss"):
+        """Record a violation for the currently active event (if any)."""
         if self._pending_evt is None:
             return
         try:
             kind = self._pending_evt.get("kind", "?")
             dl   = float(self._pending_evt.get("deadline_s", 0.0))
-            self._logger.warn(f"[EVENT VIOLATION] kind={kind} deadline_s={dl:.3f} reason={reason}")
+            self._logger.info({
+                        "kind" : kind,
+                            "outcome" : "VIOLATION",
+                            "reason" : reason,
+                            "deadline" : round(dl, 3)
+                        }, 
+                        extra = {
+                            "type" : "EVENT"
+                        })
         except Exception:
             pass
 
     def _evt_clear(self):
+        """Stop workers and clear event state (called on resolve or miss)."""
+        with self._evt_lock:
+            self._evt_proposals.clear()
+        for t in self._evt_threads:
+            if t.is_alive():
+                t.join(timeout=0.002)
+        self._evt_threads.clear()
         self._pending_evt = None
         self._evt_deadline_at = 0.0
         self._evt_active = False
@@ -496,23 +647,93 @@ class LidarTargetNavigatorAPE1:
             # ---------- Scan & metrics ----------
             front, left, right, stale, scan, now = self._scan_metrics()
 
-            # ---- Event intake: preempt old with violation, accept new ----
+            # ---- Event intake ----
             evt = self._node_evt.pop()
             if evt is not None:
+                # If an event is already active, try to RESOLVE CURRENT first:
                 if self._evt_active:
-                    self._evt_violate("preempted_by_new_event")
-                    self._evt_clear()
+                    # Choose best ready plan for the CURRENT event; else count violation
+                    tl_curr = max(0.0, self._evt_deadline_at - time.time())
+
+                    # Which planner we prefer for the *current* event given its remaining time
+                    if tl_curr > self._edc.t_med_s:
+                        prefer = ["APE3", "APE2", "APE1"]
+                    elif tl_curr > self._edc.t_hard_s:
+                        prefer = ["APE2", "APE1"]
+                    else:
+                        prefer = ["APE1"]
+
+                    with self._evt_lock:
+                        ready_curr = dict(self._evt_proposals)
+
+                    chosen_curr = None
+                    for name in prefer:
+                        if name in ready_curr:
+                            chosen_curr = (name, ready_curr[name]); break
+
+                    if chosen_curr is not None:
+                        # Apply the ready plan once before switching to the new event
+                        _, prop = chosen_curr
+                        v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
+                        if not self._evt_resolved:
+                            self._evt_resolved = True
+                            try:
+                                kind = self._pending_evt.get("kind", "?")
+                                self._logger.info({
+                                    "kind" : kind,
+                                    "outcome" : "RESOLVED",
+                                    "reason" : "PREMPTIVE",
+                                    "resolver" : chosen_curr[0],
+                                    }, 
+                                    extra = {
+                                        "type" : "EVENT"
+                                    })    
+                            except Exception:
+                                pass
+                        # Clear the old event (considered resolved)
+                        self._evt_clear()
+                    else:
+                        # Nothing ready → violation on the current, then drop it
+                        self._evt_violate("preempt_no_plan_ready")
+                        self._evt_clear()
+
+                # Activate the NEW event
                 self._pending_evt = evt
                 self._evt_deadline_at = evt["t_recv"] + max(0.0, float(evt.get("deadline_s", 0.0)))
                 self._evt_active = True
                 self._evt_resolved = False
+
+                # clear old proposals and threads (safety)
+                with self._evt_lock:
+                    self._evt_proposals = {}
+                for t in self._evt_threads:
+                    if t.is_alive(): t.join(timeout=0.001)
+                self._evt_threads = []
+
+                # Snapshot deterministic state
+                snap = {
+                    "x": x, "y": y, "z": z, "yaw": yaw,
+                    "tx": tx, "ty": ty, "tz": tz,
+                    "v_cmd": v_cmd, "wz_cmd": wz_cmd, "vz_cmd": vz_cmd,
+                    "scan": scan,
+                    "front": front, "left": left, "right": right,
+                    "yaw_err": _wrap_pi(math.atan2(ey, ex) - yaw),
+                }
+
+                # Fire one-shot planners in parallel
+                self._evt_threads = [
+                    threading.Thread(target=self._evt_plan_ape1, args=(snap, self._edc.ape1_budget_ms), daemon=True),
+                    threading.Thread(target=self._evt_plan_ape2, args=(snap, self._edc.ape2_budget_ms), daemon=True),
+                    threading.Thread(target=self._evt_plan_ape3, args=(snap, self._edc.ape3_budget_ms), daemon=True),
+                ]
+                for t in self._evt_threads: t.start()
 
             def _evt_time_left():
                 return max(0.0, self._evt_deadline_at - time.time())
 
             event_active = self._evt_active and (self._pending_evt is not None)
 
-            # Hard-stale → brake
+            # Hard-stale: brake until scans recover
             _, t_last = self._node_scan.latest()
             if (time.time() - t_last) > self._ac.hard_stale_sec:
                 self._teleop.set_cmd(0.0, 0.0, 0.0, 0.0)
@@ -561,7 +782,7 @@ class LidarTargetNavigatorAPE1:
             if min(left, right) < self._gc.edge_guard_m:
                 v_cmd = min(v_cmd, self._gc.edge_guard_scale * self._gc.max_v)
 
-            # Risk/NFZ adjustments
+            # Inflate safe by risk; enforce min distance near no-fly
             if risk > 0.0:
                 effective_safe_m *= (1.0 + self._rc.risk_gain_safe * risk)
             if math.isfinite(nf_dist) and nf_dist < self._rc.nofly_min_dist_m:
@@ -570,7 +791,7 @@ class LidarTargetNavigatorAPE1:
 
             max_v_risk_cap = self._gc.max_v * (1.0 - self._rc.risk_gain_speed * risk)
 
-            # ---------- Event window: APE1-only ----------
+            # ---------- Event window: safety bump + choose best-ready plan ----------
             if event_active:
                 # temporary safety & speed caps during event handling
                 effective_safe_m += self._edc.safe_inflate_m
@@ -578,24 +799,49 @@ class LidarTargetNavigatorAPE1:
 
                 tl = _evt_time_left()
 
+                # If deadline passed and we never applied an event plan -> violation
                 if tl <= 0.0:
                     if not self._evt_resolved:
-                        self._evt_violate("deadline_miss")
+                        self._evt_violate("DEADLINE_MISS")
                     self._evt_clear()
                 else:
-                    # We ONLY react when within APE1 tier (tight deadline).
-                    if tl <= self._edc.t_hard_s:
-                        v_cmd, wz_cmd, vz_cmd = self._evt_apply_ape1(v_cmd, wz_cmd, vz_cmd, left, right)
+                    # Choose target APE by time-left
+                    target_name = "APE3" if tl > self._edc.t_med_s else ("APE2" if tl > self._edc.t_hard_s else "APE1")
+
+                    with self._evt_lock:
+                        ready = dict(self._evt_proposals)
+
+                    order = {
+                        "APE3": ["APE3", "APE2", "APE1"],
+                        "APE2": ["APE2", "APE1"],
+                        "APE1": ["APE1"]
+                    }[target_name]
+
+                    chosen = None
+                    for name in order:
+                        if name in ready:
+                            chosen = (name, ready[name])
+                            break
+
+                    if chosen is not None:
+                        _, prop = chosen
+                        v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
                         if not self._evt_resolved:
                             self._evt_resolved = True
                             try:
                                 kind = self._pending_evt.get("kind", "?")
-                                self._logger.info(f"[EVENT RESOLVED] kind={kind} by APE1 with {tl:.3f}s left")
+                                self._logger.info({
+                                        "kind" : kind,
+                                        "outcome" : "RESOLVED",
+                                        "reason" : "SUCCESS",
+                                        "resolver" : chosen[0],
+                                        "time_left" : round(tl, 3)
+                                    }, 
+                                    extra = {
+                                        "type" : "EVENT"
+                                    })    
                             except Exception:
                                 pass
-                        # Clear immediately after the one-shot reaction (for clean A/B comparison)
-                        self._evt_clear()
-                    # else: ignore event (not in APE1 activation tier), continue baseline
 
             # ---------- Avoidance / heading select ----------
             if stale:
@@ -621,32 +867,47 @@ class LidarTargetNavigatorAPE1:
                         v_cmd = 0.0
                         wz_cmd = self._avoid_sign * min(self._gc.max_wz, self._ac.turn_rate)
                     else:
-                        # (Keep your baseline heading selection, but for this APE1-only test
-                        #  we stick to kp yaw to target and sticky-wall bias)
+                        if scan is not None:
+                            hdg_off = self._choose_heading(scan, yaw_err, x, y)
+                            yaw_goal = _wrap_pi(hdg_off)
+                            wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
+                        # Sticky-wall: bias away if side too close
                         side_min = min(left, right)
                         if side_min < 1.2 * self._rc.vehicle_radius_m + 0.6:
                             if left < right:  wz_cmd -= 0.25
                             else:             wz_cmd += 0.25
+                        # Flip side-bias if oscillating in crumbs
                         if self._crumb_hits_recent >= self._sc.crumb_oscillations_to_flip:
                             self._side_bias *= -1
                             self._crumb_hits_recent = 0
+                            '''
                             try:
-                                self._logger.info("[APE1] Breadcrumb: flip side-bias due to oscillation")
+                                self._logger.info({
+                                    "kind" : "Breadcrumb",
+                                    "reason" : "flip side-bias due to oscillation"
+                                    }, 
+                                    extra = {
+                                        "type" : "NAVIGATION"
+                                    })    
+                            
                             except Exception:
                                 pass
+                            '''
 
-            # ---------- Doorway + TTC + stopping distance ----------
+            # ---------- Doorway handling + TTC + stopping distance ----------
             dmin = float('inf')
             if scan is not None:
                 window = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
                 dmin = min(window) if window else float('inf')
 
+                # Doorway: if narrow, align first and go slow
                 min_clear = 2.0*self._rc.vehicle_radius_m + 0.6
                 if math.isfinite(corr_width) and corr_width < (min_clear + 1.0):
                     v_cmd = min(v_cmd, 0.25 * self._gc.max_v)
                     sgn = 1.0 if corr_skew > 0.0 else -1.0
                     wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, wz_cmd + 0.5*sgn))
 
+                # TTC map
                 if v_cmd > 0.05 and math.isfinite(dmin) and dmin > 0.0:
                     ttc = dmin / max(v_cmd, 1e-3)
                     if ttc < self._sc.ttc_soft_s:
@@ -654,23 +915,18 @@ class LidarTargetNavigatorAPE1:
                         den = max(self._sc.ttc_soft_s - self._sc.ttc_hard_s, 1e-3)
                         frac = max(self._sc.v_min_frac, min(1.0, num / den))
                         v_cmd = self._gc.max_v * frac
-                    # stopping distance rule
-                    if not math.isfinite(dmin) or dmin <= self._rc.stop_margin_m:
-                        v_cmd = 0.0
-                    else:
-                        vmax = math.sqrt(max(0.0, 2.0*self._rc.max_decel_mps2*(dmin - self._rc.stop_margin_m)))
-                        v_cmd = min(v_cmd, vmax)
+                    v_cmd = self._stopping_limited_speed(v_cmd, dmin)
 
-            # Curvature & risk caps
+            # Curvature-aware speed cap + risk cap
+            v_cmd = min(v_cmd, max_v_risk_cap)
             v_cmd = min(v_cmd, self._gc.max_v / (1.0 + self._rc.curvature_k * abs(wz_cmd)))
-            v_cmd = min(v_cmd, self._gc.max_v * (1.0 - self._rc.risk_gain_speed * risk))
 
             # Heading-rate cap near obstacles
             nearest = min(front, left, right)
             if nearest < self._sc.near_obs_m:
                 wz_cmd = max(-self._sc.cap_wz_near_obs, min(self._sc.cap_wz_near_obs, wz_cmd))
 
-            # ---------- Progress watchdog ----------
+            # ---------- Progress watchdog (escape rotate if stuck) ----------
             if self._progress_t0 is None:
                 self._progress_t0 = now
                 self._progress_d0 = dist
@@ -691,6 +947,7 @@ class LidarTargetNavigatorAPE1:
             base_dv_max = self._sc.dv_max_mps_per_s * dt
             dwz_max = self._sc.jw_max_radps2 * dt
 
+            # Detect "empty heading"
             empty_heading = (
                 (not self._avoiding) and
                 math.isfinite(dmin) and dmin >= self._sc.clear_ahead_thresh_m and
@@ -698,7 +955,7 @@ class LidarTargetNavigatorAPE1:
             )
 
             dv_up_max = base_dv_max * (self._sc.dv_clear_scale if empty_heading else 1.0)
-            dv_down_max = base_dv_max * 1.5
+            dv_down_max = base_dv_max * 1.5  # braking stronger
 
             if v_cmd > self._v_cmd_prev:
                 v_cmd = min(self._v_cmd_prev + dv_up_max, v_cmd)

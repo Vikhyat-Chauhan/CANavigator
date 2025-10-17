@@ -22,10 +22,10 @@ from rclpy.executors import SingleThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+import logging
 
-from .teleop import GzTeleop
-from .logger import Logger
-from .config import TeleopConfig
+from hydra_teleop.teleop import GzTeleop
+from hydra_teleop.config import TeleopConfig
 
 # ---------- small math ----------
 def _yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
@@ -202,15 +202,14 @@ class LidarTargetNavigatorAPE2:
                  goto_cfg: Optional[GoToConfig] = None,
                  avoid_cfg: Optional[AvoidCfg] = None,
                  crumb_cfg: Optional[BreadcrumbCfg] = None,
-                 safety_cfg: Optional[SafetyCfg] = None,
-                 logger: Optional[Logger] = None):
+                 safety_cfg: Optional[SafetyCfg] = None):
         self._teleop = teleop
         self._cfg = cfg
         self._gc = goto_cfg or GoToConfig()
         self._ac = avoid_cfg or AvoidCfg()
         self._bc = crumb_cfg or BreadcrumbCfg()
         self._sc = safety_cfg or SafetyCfg()
-        self._logger = logger or Logger(cfg)
+        self._logger = logging.getLogger(__name__)
 
         entity = getattr(cfg, "entity_name", "drone1")
         drone_topic = drone_pose_topic or getattr(cfg, "ros_pose_topic", f"/model/{entity}/pose/info")
@@ -317,7 +316,15 @@ class LidarTargetNavigatorAPE2:
         try:
             kind = self._pending_evt.get("kind", "?")
             dl   = float(self._pending_evt.get("deadline_s", 0.0))
-            self._logger.warn(f"[EVENT VIOLATION] kind={kind} deadline_s={dl:.3f} reason={reason}")
+            self._logger.info({
+                        "kind" : kind,
+                            "outcome" : "VIOLATION",
+                            "reason" : reason,
+                            "deadline" : round(dl, 3)
+                        }, 
+                        extra = {
+                            "type" : "EVENT"
+                        })
         except Exception:
             pass
 
@@ -410,7 +417,7 @@ class LidarTargetNavigatorAPE2:
             evt = self._node_evt.pop()
             if evt is not None:
                 if self._evt_active:
-                    self._evt_violate("preempted_by_new_event")
+                    self._evt_violate("PREMPTIVE")
                     self._evt_clear()
                 self._pending_evt = evt
                 self._evt_deadline_at = evt["t_recv"] + max(0.0, float(evt.get("deadline_s", 0.0)))
@@ -473,7 +480,7 @@ class LidarTargetNavigatorAPE2:
                 tl = _evt_time_left()
                 if tl <= 0.0:
                     if not self._evt_resolved:
-                        self._evt_violate("deadline_miss")
+                        self._evt_violate("DEADLINE_MISS")
                     self._evt_clear()
                 else:
                     with self._evt_lock:
@@ -485,7 +492,16 @@ class LidarTargetNavigatorAPE2:
                             self._evt_resolved = True
                             try:
                                 kind = self._pending_evt.get("kind", "?")
-                                self._logger.info(f"[EVENT RESOLVED] kind={kind} by APE2 with {tl:.3f}s left")
+                                self._logger.info({
+                                        "kind" : kind,
+                                        "outcome" : "RESOLVED",
+                                        "reason" : "SUCCESS",
+                                        "resolver" : "APE2",
+                                        "time_left" : round(tl, 3)
+                                    }, 
+                                    extra = {
+                                        "type" : "EVENT"
+                                    })  
                             except Exception:
                                 pass
 
@@ -531,8 +547,19 @@ class LidarTargetNavigatorAPE2:
                         if self._crumb_hits_recent >= self._sc.crumb_oscillations_to_flip:
                             self._side_bias *= -1
                             self._crumb_hits_recent = 0
-                            try: self._logger.info("[APE2] Breadcrumb: flipped side-bias")
-                            except Exception: pass
+                            '''
+                            try:
+                                self._logger.info({
+                                    "kind" : "Breadcrumb",
+                                    "reason" : "flip side-bias due to oscillation"
+                                    }, 
+                                    extra = {
+                                        "type" : "NAVIGATION"
+                                    })    
+                            
+                            except Exception:
+                                pass
+                            '''
 
             # TTC + stopping distance
             dmin = float('inf')

@@ -8,6 +8,7 @@ import json, os, threading
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+import logging
 
 META_PATH = os.path.join("models", "generated", "generated_nofly_meta.json")
 
@@ -67,6 +68,8 @@ class ViolationCounter(Node):
         corner_margin_m=0.25,  # NEW: radius of rounded corner cutouts
     ):
         super().__init__("violation_counter")
+        # Get Logger 
+        self._logger = logging.getLogger(__name__)
 
         # Allow tuning via ROS params or constructor args (constructor defaults shown above).
         self.declare_parameter("zone_padding_m", zone_padding_m)
@@ -77,14 +80,17 @@ class ViolationCounter(Node):
         self._corner_r = max(0.0, float(self.get_parameter("corner_margin_m").value))
 
         self._rects = load_rects(meta_path)
-        self._violations = 0
         self._inside_any = False
 
         self.create_subscription(PoseStamped, pose_topic, self._on_pose, 10)
-        self.get_logger().info(
-            f"[violations] Loaded {len(self._rects)} boxes. "
-            f"zone_padding_m={self._pad:.3f} m, corner_margin_m={self._corner_r:.3f} m"
-        )
+        self._logger.info({
+                            "boxes" : len(self._rects),
+                            "zone_padding" : round(self._pad,3),
+                            "corner_margin" : round(self._corner_r,3)
+                        },
+                        extra = {
+                            "type" : "LOADEDBOXES"
+                        })  
 
     def _on_pose(self, msg: PoseStamped):
         x, y = msg.pose.position.x, msg.pose.position.y
@@ -95,23 +101,15 @@ class ViolationCounter(Node):
 
         # detect new entry (but ignore rounded-corner cutouts)
         if in_zone and not self._inside_any:
-            self._violations += 1
-            self.get_logger().warn(
-                f"Violation {self._violations}: entered restricted zone at ({x:.2f}, {y:.2f})"
-            )
+            self._logger.info({
+                            "x" : round(x, 2),
+                            "y" : round(y, 2)
+                        },
+                        extra = {
+                            "type" : "ZONEVIOLATION"
+                        })  
 
         self._inside_any = in_zone
-
-    def get_total(self) -> int:
-        """Return total violations so far (does not reset)."""
-        return self._violations
-
-    def reset(self):
-        """Reset violation counter to zero."""
-        self._violations = 0
-        # (Optional) If you ever want to fully clear state, you could also:
-        # self._inside_any = False
-
 
 def start_violation_monitor(
     pose_topic="/model/drone1/pose/info",

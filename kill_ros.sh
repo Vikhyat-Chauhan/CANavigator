@@ -26,7 +26,7 @@ done
 # Add/remove patterns here if you run other tools.
 PATTERNS=(
   "/opt/ros/.*/bin/ros2"
-  "/opt/ros/.*/lib/rviz2/rviz2"
+  #"/opt/ros/.*/lib/rviz2/rviz2"
   "ros_gz_bridge"
   "parameter_bridge"
   "/gz/transport.*/gz-transport-"

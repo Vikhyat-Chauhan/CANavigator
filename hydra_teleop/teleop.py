@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 import threading
+import logging
+
 from typing import Tuple, Optional
 
 from .transport import GzVelPub
 from .config import TeleopConfig
-from .logger import Logger
 from .physics import DronePhysics
 
 
@@ -35,7 +36,7 @@ class GzTeleop:
         self.topic = topic
         self.cfg = cfg
 
-        self._logger = Logger(cfg)
+        self._logger = logging.getLogger(__name__)
         self._pub = GzVelPub(self.topic)
 
         # Physics model (encapsulates states & tunables)
@@ -77,8 +78,12 @@ class GzTeleop:
 
     # -------------- public API --------------
     def start(self) -> None:
-        self._logger.log(source="GzTeleop", event="start",
-                         message="Teleop started (physics-shaped controller ON)")
+        self._logger.info({
+                            "physics" : True
+                        },
+                        extra = {
+                            "event" : "Started"
+                        })  
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -96,18 +101,26 @@ class GzTeleop:
         angular: Tuple[float, float, float],
     ) -> None:
         # Direct one-shot publish (bypasses physics shaping)
-        self._logger.log(
-            source="GzTeleop", event="publish_once", message="",
-            vx=linear[0], vy=linear[1], vz=linear[2],
-            wx=angular[0], wy=angular[1], wz=angular[2]
-        )
+        self._logger.info({
+                            "vx" : linear[0],
+                            "vy" : linear[1],
+                            "vz" : linear[2],
+                            "wx" : angular[0],
+                            "wx" : angular[0],
+                            "wx" : angular[0],
+                        },
+                        extra = {
+                            "event" : "PUBLISH_ONCE"
+                        })  
         try:
             self._pub.send(linear, angular)
         except Exception:
             pass
 
     def stop(self) -> None:
-        self._logger.log(source="GzTeleop", event="stop", message="set desired velocity -> 0 (coast)")
+        self._logger.info({
+                            "event" : "STOP"
+                        })
         self.set_cmd(0.0, 0.0, 0.0, 0.0)
 
     def shutdown(self, join_timeout: float = 0.3) -> None:

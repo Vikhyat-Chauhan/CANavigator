@@ -10,6 +10,7 @@ from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
+import logging
 
 from hydra_teleop.config import TeleopConfig
 
@@ -32,10 +33,15 @@ class EventCfg:
     seed: Optional[int] = None
     jitter_s: float = 0.05
 
-    # Deadlines (base when no kinematic estimate available)
+    # Deadlines (constant, fairness-oriented)
     default_deadline_s: float = 0.35
     min_deadline_s: float = 0.12
     max_deadline_s: float = 0.80
+    deadline_scale: float = 1.0
+    # Optional per-kind constants (if None, fall back to default_deadline_s)
+    enemy_deadline_s: Optional[float] = None
+    obstacle_deadline_s: Optional[float] = None
+    lane_deadline_s: Optional[float] = None
 
     # Bounds for 2D arena (for spawned events)
     x_min: float = -100.0; x_max: float = 100.0
@@ -104,10 +110,14 @@ class EventCfg:
         ec = EventCfg(
             topic=getattr(cfg, "event_topic", "/hydra/event"),
             seed=getattr(cfg, "event_seed", None),
-            jitter_s=float(getattr(cfg, "event_deadline_jitter_s", 0.05)),
-            default_deadline_s=float(getattr(cfg, "event_default_deadline_s", 0.35)),
-            min_deadline_s=float(getattr(cfg, "event_min_deadline_s", 0.12)),
-            max_deadline_s=float(getattr(cfg, "event_max_deadline_s", 0.80)),
+            jitter_s=float(cfg.event_deadline_jitter_s),
+            default_deadline_s=float(cfg.event_default_deadline_s),
+            min_deadline_s=cfg.event_min_deadline_s,
+            max_deadline_s=cfg.event_max_deadline_s,
+            deadline_scale=float(cfg.event_deadline_scale), 
+            enemy_deadline_s=getattr(cfg, "event_enemy_deadline_s", None),
+            obstacle_deadline_s=getattr(cfg, "event_obstacle_deadline_s", None),
+            lane_deadline_s=getattr(cfg, "event_lane_deadline_s", None),
             x_min=float(bounds[0]), x_max=float(bounds[1]),
             y_min=float(bounds[2]), y_max=float(bounds[3]),
             enemy_speed_min=float(getattr(cfg, "event_enemy_speed_min", 1.0)),
@@ -140,10 +150,10 @@ class EventCfg:
 
 class EventEmitter(Node):
     """
-    Bettendorf-like experiment generator:
+    B-like experiment generator:
       • Phased Poisson arrivals with optional burstiness
       • Drone-relative enemy crossings & sudden obstacles
-      • Deadlines derived from time-to-conflict (TTC) when possible
+      • **Fairness**: constant, configurable deadlines (no TTC dependency)
       • Reproducible via seed
       • CSV logging
     """
@@ -290,18 +300,35 @@ class EventEmitter(Node):
             return base * self._rnd.uniform(0.2, 0.6)  # burst cluster
         return base
 
-    # --------------------- Emitters with TTC-based deadlines ---------------------
+    # --------------------- Deadline helper ---------------------
+    def _pick_deadline(self, kind: str) -> float:
+        """Fairness: constant deadlines (per-kind override -> default) * scale, then jitter+clamp."""
+        if kind == "ENEMY" and self._cfg.enemy_deadline_s is not None:
+            base = float(self._cfg.enemy_deadline_s)
+        elif kind == "SUDDEN_OBSTACLE" and self._cfg.obstacle_deadline_s is not None:
+            base = float(self._cfg.obstacle_deadline_s)
+        elif kind == "LANE_BLOCK" and self._cfg.lane_deadline_s is not None:
+            base = float(self._cfg.lane_deadline_s)
+        else:
+            base = self._cfg.default_deadline_s
+
+        d = max(0.0, base * self._cfg.deadline_scale)
+
+        # jitter
+        if self._cfg.jitter_s > 0.0:
+            d = d + self._rnd.uniform(-self._cfg.jitter_s, +self._cfg.jitter_s)
+            d = max(0.0, d)
+
+        # clamp
+        d = min(max(d, self._cfg.min_deadline_s), self._cfg.max_deadline_s)
+        return d
+
+    # --------------------- Emitters (geometry realistic; deadline constant) ---------------------
 
     def _emit(self, kind: str, meta: Dict[str, Any], deadline_s: float, phase_idx: int):
-        # jitter & clamp
-        if self._cfg.jitter_s > 0.0:
-            deadline_s = max(0.0, deadline_s + self._rnd.uniform(-self._cfg.jitter_s, +self._cfg.jitter_s))
-        deadline_s = min(max(deadline_s, self._cfg.min_deadline_s), self._cfg.max_deadline_s)
-
         obj = {"kind": kind, "t_emit": time.time(), "deadline_s": deadline_s, "meta": meta}
         msg = String(); msg.data = json.dumps(obj)
         self._pub.publish(msg)
-
         if self._csv_fp:
             self._csv.writerow([obj["t_emit"], kind, deadline_s, json.dumps(meta), phase_idx])
 
@@ -315,40 +342,32 @@ class EventEmitter(Node):
             ang = self._rnd.uniform(-math.pi, math.pi)
             vx, vy = speed*math.cos(ang), speed*math.sin(ang)
             rad = self._rnd.uniform(self._cfg.enemy_radius_min, self._cfg.enemy_radius_max)
-            deadline_s = self._cfg.default_deadline_s
+            deadline_s = self._pick_deadline("ENEMY")
             self._emit("ENEMY", {"pos":[x,y],"vel":[vx,vy],"radius":rad}, deadline_s, phase_idx)
             return
 
         x, y, yaw = pose
-        # Place crossing point ahead of drone
         ahead = self._cfg.enemy_cross_dist_ahead
         lateral = self._cfg.enemy_cross_lateral * (1 if self._rnd.random()<0.5 else -1)
         cx = x + ahead*math.cos(yaw) - lateral*math.sin(yaw)
         cy = y + ahead*math.sin(yaw) + lateral*math.cos(yaw)
 
-        # Enemy moves perpendicular to drone heading (crossing)
         speed = self._rnd.uniform(self._cfg.enemy_speed_min, self._cfg.enemy_speed_max)
         vx = -speed*math.sin(yaw)
         vy =  speed*math.cos(yaw)
         rad = self._rnd.uniform(self._cfg.enemy_radius_min, self._cfg.enemy_radius_max)
 
-        # TTC estimate: time until the line (enemy path) reaches drone centerline near crossing
-        # Approximate TTC by distance from crossing to current drone position projected along enemy velocity
-        relx, rely = (x - cx), (y - cy)
-        rel_v_dot = relx*vx + rely*vy  # when negative, enemy moving toward drone from crossing
-        dist = math.hypot(relx, rely)
-        ttc = dist / max(1e-3, abs(speed)) if rel_v_dot < 0 else ahead / max(1e-3, speed)
-        deadline_s = max(self._cfg.min_deadline_s, min(self._cfg.max_deadline_s, 0.5 * ttc))
+        deadline_s = self._pick_deadline("ENEMY")
         self._emit("ENEMY", {"pos":[cx,cy],"vel":[vx,vy],"radius":rad}, deadline_s, phase_idx)
 
     def _emit_obstacle_trial(self, phase_idx: int):
         pose = self._get_pose_xyyaw()
         if pose is None:
-            # fallback random
             x = self._rnd.uniform(self._cfg.x_min, self._cfg.x_max)
             y = self._rnd.uniform(self._cfg.y_min, self._cfg.y_max)
             rad = self._rnd.uniform(self._cfg.obstacle_radius_min, self._cfg.obstacle_radius_max)
-            self._emit("SUDDEN_OBSTACLE", {"pos":[x,y], "radius":rad}, self._cfg.default_deadline_s, phase_idx)
+            deadline_s = self._pick_deadline("SUDDEN_OBSTACLE")
+            self._emit("SUDDEN_OBSTACLE", {"pos":[x,y], "radius":rad}, deadline_s, phase_idx)
             return
 
         x, y, yaw = pose
@@ -358,20 +377,18 @@ class EventEmitter(Node):
         oy = y + ahead*math.sin(yaw) + side*math.cos(yaw)
         rad = self._rnd.uniform(self._cfg.obstacle_radius_min, self._cfg.obstacle_radius_max)
 
-        # Deadline inversely related to forward distance
-        ttc = ahead / max(1.0, 8.0)  # assume nominal 8 m/s towards obstacle (or tune)
-        deadline_s = max(self._cfg.min_deadline_s, min(self._cfg.max_deadline_s, 0.6 * ttc))
+        deadline_s = self._pick_deadline("SUDDEN_OBSTACLE")
         self._emit("SUDDEN_OBSTACLE", {"pos":[ox,oy], "radius":rad}, deadline_s, phase_idx)
 
     def _emit_lane_trial(self, phase_idx: int):
         pose = self._get_pose_xyyaw()
         if pose is None:
-            # fallback random
             cx = self._rnd.uniform(self._cfg.x_min, self._cfg.x_max)
             cy = self._rnd.uniform(self._cfg.y_min, self._cfg.y_max)
             w  = self._rnd.uniform(self._cfg.lane_w_min, self._cfg.lane_w_max)
             h  = self._rnd.uniform(self._cfg.lane_h_min, self._cfg.lane_h_max)
-            self._emit("LANE_BLOCK", {"rect":[cx,cy,w,h]}, self._cfg.default_deadline_s, phase_idx)
+            deadline_s = self._pick_deadline("LANE_BLOCK")
+            self._emit("LANE_BLOCK", {"rect":[cx,cy,w,h]}, deadline_s, phase_idx)
             return
 
         x, y, yaw = pose
@@ -382,21 +399,19 @@ class EventEmitter(Node):
         w  = self._rnd.uniform(self._cfg.lane_w_min, self._cfg.lane_w_max)
         h  = self._rnd.uniform(self._cfg.lane_h_min, self._cfg.lane_h_max)
 
-        # Deadline from distance & assumed speed
-        ttc = ahead / max(1.0, 8.0)
-        deadline_s = max(self._cfg.min_deadline_s, min(self._cfg.max_deadline_s, 0.7 * ttc))
+        deadline_s = self._pick_deadline("LANE_BLOCK")
         self._emit("LANE_BLOCK", {"rect":[cx,cy,w,h]}, deadline_s, phase_idx)
 
     # --------------------- Manual API (still available) ---------------------
 
     def emit_enemy(self, pos_xy, vel_xy=(0.0,0.0), radius=2.0, deadline_s: Optional[float]=None, phase_idx:int=-1):
-        dl = self._cfg.default_deadline_s if deadline_s is None else float(deadline_s)
+        dl = self._pick_deadline("ENEMY") if deadline_s is None else float(deadline_s)
         self._emit("ENEMY", {"pos":list(pos_xy),"vel":list(vel_xy),"radius":float(radius)}, dl, phase_idx)
 
     def emit_lane_block(self, rect_xywh, deadline_s: Optional[float]=None, phase_idx:int=-1):
-        dl = self._cfg.default_deadline_s if deadline_s is None else float(deadline_s)
+        dl = self._pick_deadline("LANE_BLOCK") if deadline_s is None else float(deadline_s)
         self._emit("LANE_BLOCK", {"rect":list(rect_xywh)}, dl, phase_idx)
 
     def emit_sudden_obstacle(self, pos_xy, radius=1.5, deadline_s: Optional[float]=None, phase_idx:int=-1):
-        dl = self._cfg.default_deadline_s if deadline_s is None else float(deadline_s)
+        dl = self._pick_deadline("SUDDEN_OBSTACLE") if deadline_s is None else float(deadline_s)
         self._emit("SUDDEN_OBSTACLE", {"pos":list(pos_xy), "radius":float(radius)}, dl, phase_idx)
