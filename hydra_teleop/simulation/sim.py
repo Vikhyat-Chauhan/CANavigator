@@ -1,5 +1,5 @@
 import os, signal, subprocess, time
-from .config import TeleopConfig
+from ..config import TeleopConfig
 
 
 def launch(cmd: list[str] | tuple[str, ...], env: dict | None = None) -> subprocess.Popen:

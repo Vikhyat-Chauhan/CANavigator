@@ -16,7 +16,7 @@ class TeleopConfig:
     world_pose_topic: str = "/world/airport/pose/info"
 
     # --- Teleop dynamics ---
-    rate_hz: float = 30.0
+    rate_hz: float = 30
     speed_x: float = 5.0
     speed_y: float = 5.0
     speed_z: float = 5.0
@@ -97,7 +97,7 @@ class TeleopConfig:
     time_budget_s: float | None = None  # set a number if you want a budget
 
     # =======================
-    # Event Generator
+    # Event Generator (B-style)
     # =======================
     # Topics
     event_topic = "/hydra/event"
@@ -106,37 +106,54 @@ class TeleopConfig:
     # Reproducibility (optional)
     event_seed = 42
 
-    # Deadlines — tight & clamped (CLAMP IS ENABLED in your emitter)
-    event_deadline_scale = 0.62   # global squeeze; makes everyone work harder
-    event_deadline_jitter_s = 0.03
-    event_default_deadline_s = 0.16
-    event_min_deadline_s = 0.09
-    event_max_deadline_s = 0.60
+    # -----------------------
+    # Time constraint model
+    # -----------------------
+    # Event spacing follows a log-uniform distribution between these bounds.
+    # The time between two events (Δt) is the *actual constraint*.
+    # Short intervals create overlapping / near-deadline pressure on APEs.
+    event_dt_min_s = 0.08   # lower bound (tightest events)
+    event_dt_max_s = 3.5    # upper bound (slow cycles)
 
-    # Per-kind deadlines (hardest first)
-    # Lane & Obstacle are intentionally tighter → APE3 struggles most here.
-    event_lane_deadline_s     = 0.12
-    event_obstacle_deadline_s = 0.13
-    event_enemy_deadline_s    = 0.18   # a bit more forgiving
+    # Optional single global deadline for legacy consumers.
+    # Usually left None (since Δt itself acts as the time constraint).
+    event_global_deadline_s = None
+
+    # -----------------------
+    # Mixture of event types
+    # -----------------------
+    # Defines probabilities for each kind.
+    event_mix_enemy = 0.33
+    event_mix_obstacle = 0.33
+    event_mix_lane = 0.34
+
+    # -----------------------
     # Arena bounds
+    # -----------------------
     event_bounds_xy = (-100.0, 100.0, -50.0, 50.0)
 
+    # -----------------------
     # Enemy
+    # -----------------------
     event_enemy_speed_min = 1.0
-    event_enemy_speed_max = 4.0
+    event_enemy_speed_max = 3.5
     event_enemy_radius_min = 1.0
     event_enemy_radius_max = 3.0
     event_enemy_cross_dist_ahead = 15.0
     event_enemy_cross_lateral = 8.0
 
+    # -----------------------
     # Sudden obstacle
+    # -----------------------
     event_obstacle_radius_min = 1.0
     event_obstacle_radius_max = 2.5
     event_obstacle_ahead_min = 8.0
     event_obstacle_ahead_max = 20.0
     event_obstacle_side_span = 10.0
 
+    # -----------------------
     # Lane block
+    # -----------------------
     event_lane_w_min = 6.0
     event_lane_w_max = 12.0
     event_lane_h_min = 4.0
@@ -144,25 +161,11 @@ class TeleopConfig:
     event_lane_ahead_min = 15.0
     event_lane_ahead_max = 35.0
 
-    # Phases — increasing arrival rate + burstiness so late windows are toughest.
-    # Mix leans a bit toward LANE_BLOCK (hardest) and keeps some OBSTACLE.
-    event_phases = [
-        # Warm-ish: mostly solvable for APE1/APE2; APE3 starts to miss.
-        {"duration_s": 40.0, "rate_hz": 0.14,
-        "mix_enemy": 0.30, "mix_obstacle": 0.30, "mix_lane": 0.40,
-        "burstiness": 0.00},
-
-        # Harder: more arrivals + mild burst clusters → more tight overlaps.
-        {"duration_s": 40.0, "rate_hz": 0.22,
-        "mix_enemy": 0.28, "mix_obstacle": 0.30, "mix_lane": 0.42,
-        "burstiness": 0.30},
-
-        # Spicy: high rate + burstiness → many deadlines tight while planning.
-        {"duration_s": 40.0, "rate_hz": 0.30,
-        "mix_enemy": 0.25, "mix_obstacle": 0.30, "mix_lane": 0.45,
-        "burstiness": 0.55},
-    ]
-
+    # -----------------------
     # Logging
-    event_log_csv_path = "events_log.csv"
+    # -----------------------
+    event_log_csv_path = "logs/events_log.csv"
     
+    deadline_alpha: float = 0.85
+    deadline_min_s: float = 0.12
+    deadline_max_s: float = 1.20

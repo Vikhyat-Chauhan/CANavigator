@@ -17,24 +17,10 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
-from hydra_teleop.teleop import GzTeleop
+from hydra_teleop.navigation.teleop import GzTeleop
 from hydra_teleop.config import TeleopConfig
 import logging
 
-#-------- loggin template --------
-'''
-    self._logger.info({
-                        "kind" : "ENEMY"|"WALL"|"ETC",
-                            "outcome" : "RESOLVED",|"VIOLATION",
-                            "reason" : "SUCCESS"|"PREMPTIVE",|"TIMEOUT",
-                            "resolver" : "APE1"|"APE2"|"APE3",
-                            "time_left" : round(dl, 3),
-                            "deadline" : round(dl, 3)
-                            }
-                        extra = {
-                            "type" : "EVENT"|"NAVIGATION"
-                        })               
-'''   
 # ---------- small math ----------
 def _yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
     t0 = +2.0 * (w * z + x * y)
@@ -58,7 +44,7 @@ class GoToConfig:
     slow_yaw_threshold: float = 1.0
     rate_hz: float = 30.0
     # edge guard to reduce corner clips without losing too much speed
-    edge_guard_m: float = 3.5
+    edge_guard_m: float = 4.5
     edge_guard_scale: float = 0.6
 
 @dataclass
@@ -71,7 +57,7 @@ class AvoidCfg:
     side_center_deg: float = 30.0  # side windows centered at ±this deg
     turn_rate: float = 0.9         # rad/s while avoiding (capped by max_wz)
     watchdog_sec: float = 0.6      # soft stale threshold
-    hard_stale_sec: float = 1.8    # hard stale -> brake
+    hard_stale_sec: float = 1.2    # hard stale -> brake
     min_turn_sec: float = 0.7      # commit to chosen side at least this long
 
 # ===== Breadcrumbs (minimal) =====
@@ -88,17 +74,17 @@ class SafetyCfg:
     ambiguity_eps_m: float = 0.5     # |left-right| < eps => ambiguous
 
     # TTC braking (distance / forward_speed)
-    ttc_soft_s: float = 2.0          # start slowing under this TTC
+    ttc_soft_s: float = 1.6          # start slowing under this TTC
     ttc_hard_s: float = 1.0          # hard clamp under this TTC
-    v_min_frac: float = 0.15         # never go below this * max_v (unless escaping)
+    v_min_frac: float = 0.20         # never go below this * max_v (unless escaping)
 
     # Cap turn-rate when any obstacle is close
     near_obs_m: float = 3.0
-    cap_wz_near_obs: float = 0.8
+    cap_wz_near_obs: float = 1.2
 
     # Corner guard: when heading change is sharp, inflate safe distance
     corner_deg: float = 30.0
-    corner_inflate_m: float = 1.5    # extra meters added to safe_m when sharp
+    corner_inflate_m: float = 2.0    # extra meters added to safe_m when sharp
 
     # Progress watchdog
     progress_window_s: float = 3.0
@@ -110,8 +96,8 @@ class SafetyCfg:
     crumb_oscillations_to_flip: int = 12
 
     # Command shaping (prevents “launch into wall”)
-    dv_max_mps_per_s: float = 8.0    # base cap on linear speed change rate
-    jw_max_radps2: float = 2.5       # cap on yaw-rate change per second
+    dv_max_mps_per_s: float = 10.0    # base cap on linear speed change rate
+    jw_max_radps2: float = 3.0       # cap on yaw-rate change per second
 
     # Gentler accel when heading is “empty” (clear & aligned)
     clear_ahead_thresh_m: float = 12.0  # forward clearance considered "empty"
@@ -128,7 +114,7 @@ class RiskCfg:
 
     # Corridor / doorway logic
     gate_half_deg: float = 12.0     # +/- sector to estimate “doorway” width
-    center_weight: float = 0.6      # bias to keep centered in corridor
+    center_weight: float = 0.8      # bias to keep centered in corridor
     align_weight: float = 0.8       # prefer headings that reduce yaw_err
     sweep_max_deg: float = 60.0     # scan heading candidates in [-this,+this]
     sweep_step_deg: float = 2.5
@@ -136,7 +122,7 @@ class RiskCfg:
 
     # No-fly boundary soft-penalty (optional; provide rectangles on cfg)
     nofly_min_dist_m: float = 3.0   # keep at least this much
-    nofly_soft_w: float = 6.0       # weight for soft 1/(d+eps) cost
+    nofly_soft_w: float = 9.0       # weight for soft 1/(d+eps) cost
     nofly_repulse_gain: float = 2.0 # repulsion vector strength
 
     # Curvature-aware speed scaling
@@ -152,15 +138,20 @@ class RiskCfg:
 class EventDecisionCfg:
     event_topic: str = "/hydra/event"
     # Deadline tiers for which planner we aim to use
-    t_hard_s: float = 0.15   # <= this → must use APE1 (fast duck)
-    t_med_s: float = 0.40    # (t_hard, t_med] → prefer APE2; else APE3
+    t_hard_s: float = 0.22   # <= this → must use APE1 (fast duck)
+    t_med_s: float = 0.55    # (t_hard, t_med] → prefer APE2; else APE3
     # Compute budgets (soft) for planners (wall-clock per event)
     ape1_budget_ms: int = 8
     ape2_budget_ms: int = 25
-    ape3_budget_ms: int = 80
+    ape3_budget_ms: int = 90   # a hair more for quality; still practical
+
     # Safety bumps during event handling
-    safe_inflate_m: float = 1.0
-    v_cap_frac: float = 0.60
+    safe_inflate_m: float = 0.5
+    v_cap_frac: float = 0.75
+    # Urgency guard: if time-left < guard, commit to first-ready in target lane
+    commit_guard_s: float = 0.0
+    # NEW: selector mode → "TROOP" (default), or force "APE1" | "APE2" | "APE3"
+    selector_mode: str = "TROOP"
 
 
 # ---- internal subscribers ----
@@ -266,6 +257,7 @@ class LidarTargetNavigatorTROOP:
     def __init__(self,
                  teleop: GzTeleop,
                  cfg: TeleopConfig,
+                 selector_mode: str,
                  drone_pose_topic: Optional[str] = None,
                  target_pose_topic: Optional[str] = "/model/target_sphere/pose/info",
                  goto_cfg: Optional[GoToConfig] = None,
@@ -281,6 +273,7 @@ class LidarTargetNavigatorTROOP:
         self._sc = safety_cfg or SafetyCfg()
         self._rc = risk_cfg or RiskCfg()
         self._logger = logging.getLogger(__name__)
+        self._logger.propagate = True  # let upstream handlers capture this
 
         entity = getattr(cfg, "entity_name", "drone1")
         drone_topic = drone_pose_topic or getattr(cfg, "ros_pose_topic", f"/model/{entity}/pose/info")
@@ -291,6 +284,27 @@ class LidarTargetNavigatorTROOP:
 
         # Event subscriber + config
         self._edc = EventDecisionCfg()
+        # Allow config.py or env var override:
+        try:
+            import os
+            sm = selector_mode
+            if sm:
+                self._edc.selector_mode = str(sm).upper().strip()
+        except Exception:
+            pass
+
+        # One-shot: log effective selector config to make runs auditable
+        self._log("CFG",
+                  type="CFG",
+                  t_hard=self._edc.t_hard_s,
+                  t_med=self._edc.t_med_s,
+                  commit_guard=self._edc.commit_guard_s,
+                  ape_budgets_ms=[self._edc.ape1_budget_ms, self._edc.ape2_budget_ms, self._edc.ape3_budget_ms],
+                  v_cap_frac=self._edc.v_cap_frac,
+                  safe_inflate_m=self._edc.safe_inflate_m,
+                  selector_mode=self._edc.selector_mode)
+        
+
         self._node_evt   = _EventSub(getattr(cfg, "event_topic", self._edc.event_topic))
 
         self._exec = SingleThreadedExecutor()
@@ -333,11 +347,24 @@ class LidarTargetNavigatorTROOP:
         self._evt_active: bool = False          # exactly one active event
         self._evt_resolved: bool = False        # did we apply an event plan before deadline?
 
+    # ---------- tiny logging helper ----------
+    def _log(self, msg: str, **fields):
+        """Safe structured logging.
+        Usage: self._log("EVENT", type="EVENT", key=value, ...)
+        Puts all user fields under extra["payload"].
+        """
+        log_type = fields.pop("type", "GEN")
+        try:
+            self._logger.info(msg, extra={"type": log_type, "payload": fields})
+        except Exception as e:
+            # Surface logging issues so they don't get swallowed
+            print("LOGGING_ERROR:", e)
+
     # ---------- threading ----------
     def _spin(self):
         try:
             while rclpy.ok():
-                self._exec.spin_once(timeout_sec=0.05)
+                self._exec.spin_once(timeout_sec=0.01)
         except Exception:
             pass
 
@@ -517,38 +544,61 @@ class LidarTargetNavigatorTROOP:
         with self._evt_lock:
             self._evt_proposals[name] = {"v": v, "wz": wz, "vz": vz, "score": score, "ready_t": time.time()}
 
-    def _evt_plan_ape1(self, snap, budget_ms):
-        # Ultra-fast “duck”: pick safer side, cap speed
+    '''def _evt_plan_ape1(self, snap, budget_ms):
+        # Ultra-fast “duck”: decisive sidestep & brake
         left, right = snap["left"], snap["right"]
         v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
         eps = self._sc.ambiguity_eps_m
         pick_left = (left > right) if abs(left-right) >= eps else (self._side_bias > 0)
-        wz_cmd += (+0.9 if pick_left else -0.9)
-        v_cmd = min(v_cmd, 0.35 * self._gc.max_v)
-        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=0.0)
+        # stronger, short commit; keep within max_wz
+        turn = (+1.1 if pick_left else -1.1)
+        wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, turn))
+        # brake more to guarantee clearance in tight TTC
+        v_cmd = min(v_cmd, 0.32 * self._gc.max_v)
+        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=0.0)'''
+    def _evt_plan_ape1(self, snap, budget_ms):
+        # Minimal APE1: keep current speed, snap heading to safer side at max yaw rate.
+        left, right = snap["left"], snap["right"]
+        v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
+
+        eps = self._sc.ambiguity_eps_m
+        max_wz = self._gc.max_wz
+
+        # Pick side (tie → use configured bias)
+        pick_left = (left > right) if abs(left - right) >= eps else (self._side_bias > 0)
+
+        # Do NOT change forward/vertical speeds; only change direction sharply.
+        # Command max yaw toward the safer side.
+        wz_cmd = (+max_wz) if pick_left else (-max_wz)
+
+        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=-999.0)
 
     def _evt_plan_ape2(self, snap, budget_ms):
-        # Local opening: sweep wider, moderate speed
+        # Local opening: sweep wider; prefer wide & aligned gaps
         t0 = time.time()
         scan = snap["scan"]
         if scan is None:
             return self._evt_put("APE2", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
-        best_deg, best_r = 0.0, -1.0
+        best_deg, best_score = 0.0, -1e18
         for deg in range(-70, 71, 2):
             r = self._range_at(scan, deg, 2.0)
-            if math.isfinite(r) and r > best_r:
-                best_r, best_deg = r, deg
+            if not math.isfinite(r): r = 0.0
+            # add mild alignment term to avoid big late turns
+            align = -0.15 * abs(deg)
+            score = r + align
+            if score > best_score:
+                best_score, best_deg = score, deg
             if (time.time() - t0)*1000.0 > budget_ms:
                 break
         hdr = math.radians(best_deg)
         yaw_goal = _wrap_pi(hdr)
         wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
-        v = min(snap["v_cmd"], 0.45 * self._gc.max_v)
-        score = - (best_r - 0.5*abs(wz))  # larger clearance & smaller |wz| better
+        v = min(snap["v_cmd"], 0.42 * self._gc.max_v)
+        score = - (max(0.0, 6.0 - float(best_score)) + 0.3*abs(wz))  # prefer wide-ish + not too twisty
         self._evt_put("APE2", v, wz, snap["vz_cmd"], score)
 
     def _evt_plan_ape3(self, snap, budget_ms):
-        # Trajectory-aware: reuse _choose_heading + curvature cap + TTC
+        # Trajectory-aware: doorway/corridor centering + TTC + curvature
         scan = snap["scan"]
         if scan is None:
             return self._evt_put("APE3", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
@@ -562,7 +612,8 @@ class LidarTargetNavigatorTROOP:
         dmin = min(window) if window else float('inf')
         v = self._stopping_limited_speed(v, dmin)
         s_clear = (dmin if math.isfinite(dmin) else 0.0)
-        score = - (1.0*s_clear - 0.4*abs(wz))
+        # More weight to clearance; tiny penalty on high yaw-rate
+        score = - (1.2*s_clear - 0.3*abs(wz))
         self._evt_put("APE3", v, wz, snap["vz_cmd"], score)
 
     # ---------- event helpers ----------
@@ -570,20 +621,9 @@ class LidarTargetNavigatorTROOP:
         """Record a violation for the currently active event (if any)."""
         if self._pending_evt is None:
             return
-        try:
-            kind = self._pending_evt.get("kind", "?")
-            dl   = float(self._pending_evt.get("deadline_s", 0.0))
-            self._logger.info({
-                        "kind" : kind,
-                            "outcome" : "VIOLATION",
-                            "reason" : reason,
-                            "deadline" : round(dl, 3)
-                        }, 
-                        extra = {
-                            "type" : "EVENT"
-                        })
-        except Exception:
-            pass
+        kind = self._pending_evt.get("kind", "?")
+        dl   = float(self._pending_evt.get("deadline_s", 0.0))
+        self._log("EVENT", type="EVENT", kind=kind, outcome="VIOLATION", reason=reason, deadline=round(dl, 3))
 
     def _evt_clear(self):
         """Stop workers and clear event state (called on resolve or miss)."""
@@ -656,12 +696,12 @@ class LidarTargetNavigatorTROOP:
                     tl_curr = max(0.0, self._evt_deadline_at - time.time())
 
                     # Which planner we prefer for the *current* event given its remaining time
-                    if tl_curr > self._edc.t_med_s:
-                        prefer = ["APE3", "APE2", "APE1"]
-                    elif tl_curr > self._edc.t_hard_s:
-                        prefer = ["APE2", "APE1"]
-                    else:
-                        prefer = ["APE1"]
+                    if tl_curr > self._edc.t_med_s: prefer = ["APE3", "APE2", "APE1"]
+                    elif tl_curr > self._edc.t_hard_s: prefer = ["APE2", "APE1"]
+                    else: prefer = ["APE1"]
+                    # Restrict to selector_mode if not TROOP
+                    if self._edc.selector_mode != "TROOP":
+                        prefer = [n for n in prefer if n == self._edc.selector_mode]
 
                     with self._evt_lock:
                         ready_curr = dict(self._evt_proposals)
@@ -677,24 +717,17 @@ class LidarTargetNavigatorTROOP:
                         v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
                         if not self._evt_resolved:
                             self._evt_resolved = True
-                            try:
-                                kind = self._pending_evt.get("kind", "?")
-                                self._logger.info({
-                                    "kind" : kind,
-                                    "outcome" : "RESOLVED",
-                                    "reason" : "PREMPTIVE",
-                                    "resolver" : chosen_curr[0],
-                                    }, 
-                                    extra = {
-                                        "type" : "EVENT"
-                                    })    
-                            except Exception:
-                                pass
+                            kind_curr = self._pending_evt.get("kind", "?")
+                            tlc = max(0.0, self._evt_deadline_at - time.time())
+                            dlc = float(self._pending_evt.get("deadline_s", 0.0))
+                            self._log("EVENT", type="EVENT", kind=kind_curr, outcome="RESOLVED",
+                                      reason="PREEMPTIVE", resolver=chosen_curr[0],
+                                      time_left=round(tlc, 3), deadline=round(dlc, 3))
                         # Clear the old event (considered resolved)
                         self._evt_clear()
                     else:
                         # Nothing ready → violation on the current, then drop it
-                        self._evt_violate("preempt_no_plan_ready")
+                        self._evt_violate("PREMPTIVE")
                         self._evt_clear()
 
                 # Activate the NEW event
@@ -720,12 +753,16 @@ class LidarTargetNavigatorTROOP:
                     "yaw_err": _wrap_pi(math.atan2(ey, ex) - yaw),
                 }
 
-                # Fire one-shot planners in parallel
-                self._evt_threads = [
-                    threading.Thread(target=self._evt_plan_ape1, args=(snap, self._edc.ape1_budget_ms), daemon=True),
-                    threading.Thread(target=self._evt_plan_ape2, args=(snap, self._edc.ape2_budget_ms), daemon=True),
-                    threading.Thread(target=self._evt_plan_ape3, args=(snap, self._edc.ape3_budget_ms), daemon=True),
-                ]
+                # Fire one-shot planners in parallel (respect selector_mode)
+                mode = self._edc.selector_mode
+                threads = []
+                if mode in ("TROOP", "APE1"):
+                    threads.append(threading.Thread(target=self._evt_plan_ape1, args=(snap, self._edc.ape1_budget_ms), daemon=True))
+                if mode in ("TROOP", "APE2"):
+                    threads.append(threading.Thread(target=self._evt_plan_ape2, args=(snap, self._edc.ape2_budget_ms), daemon=True))
+                if mode in ("TROOP", "APE3"):
+                    threads.append(threading.Thread(target=self._evt_plan_ape3, args=(snap, self._edc.ape3_budget_ms), daemon=True))
+                self._evt_threads = threads
                 for t in self._evt_threads: t.start()
 
             def _evt_time_left():
@@ -807,6 +844,9 @@ class LidarTargetNavigatorTROOP:
                 else:
                     # Choose target APE by time-left
                     target_name = "APE3" if tl > self._edc.t_med_s else ("APE2" if tl > self._edc.t_hard_s else "APE1")
+                    # If forcing standalone, target is always the forced APE
+                    if self._edc.selector_mode != "TROOP":
+                        target_name = self._edc.selector_mode
 
                     with self._evt_lock:
                         ready = dict(self._evt_proposals)
@@ -817,31 +857,33 @@ class LidarTargetNavigatorTROOP:
                         "APE1": ["APE1"]
                     }[target_name]
 
+                    # Final safety: when forced, ensure order contains only the forced APE
+                    if self._edc.selector_mode != "TROOP":
+                        order = [self._edc.selector_mode]
+
                     chosen = None
                     for name in order:
                         if name in ready:
-                            chosen = (name, ready[name])
-                            break
+                            chosen = (name, ready[name]); break
+                    # Urgency guard: if we’re inside a tiny guard window, commit immediately
+                    if chosen is None and tl < self._edc.commit_guard_s:
+                        # fall back to "any ready at all" to avoid over-waiting
+                        # but still respect selector_mode
+                        if ready:
+                            for name, prop in ready.items():
+                                if self._edc.selector_mode == "TROOP" or name == self._edc.selector_mode:
+                                    chosen = (name, prop); break
 
                     if chosen is not None:
                         _, prop = chosen
                         v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
                         if not self._evt_resolved:
                             self._evt_resolved = True
-                            try:
-                                kind = self._pending_evt.get("kind", "?")
-                                self._logger.info({
-                                        "kind" : kind,
-                                        "outcome" : "RESOLVED",
-                                        "reason" : "SUCCESS",
-                                        "resolver" : chosen[0],
-                                        "time_left" : round(tl, 3)
-                                    }, 
-                                    extra = {
-                                        "type" : "EVENT"
-                                    })    
-                            except Exception:
-                                pass
+                            kind_now = self._pending_evt.get("kind", "?")
+                            dl_now  = float(self._pending_evt.get("deadline_s", 0.0))
+                            self._log("EVENT", type="EVENT", kind=kind_now, outcome="RESOLVED",
+                                      reason="SUCCESS", resolver=chosen[0],
+                                      time_left=round(tl, 3), deadline=round(dl_now, 3))
 
             # ---------- Avoidance / heading select ----------
             if stale:
@@ -880,19 +922,6 @@ class LidarTargetNavigatorTROOP:
                         if self._crumb_hits_recent >= self._sc.crumb_oscillations_to_flip:
                             self._side_bias *= -1
                             self._crumb_hits_recent = 0
-                            '''
-                            try:
-                                self._logger.info({
-                                    "kind" : "Breadcrumb",
-                                    "reason" : "flip side-bias due to oscillation"
-                                    }, 
-                                    extra = {
-                                        "type" : "NAVIGATION"
-                                    })    
-                            
-                            except Exception:
-                                pass
-                            '''
 
             # ---------- Doorway handling + TTC + stopping distance ----------
             dmin = float('inf')

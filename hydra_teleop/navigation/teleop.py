@@ -9,8 +9,8 @@ import logging
 from typing import Tuple, Optional
 
 from .transport import GzVelPub
-from .config import TeleopConfig
-from .physics import DronePhysics
+from ..config import TeleopConfig
+from ..simulation.physics import DronePhysics
 
 
 class GzTeleop:

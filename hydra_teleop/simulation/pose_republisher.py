@@ -21,7 +21,7 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from .config import TeleopConfig
+from ..config import TeleopConfig
 
 # ---------- Helpers ----------
 def _fnum(x, default=0.0):

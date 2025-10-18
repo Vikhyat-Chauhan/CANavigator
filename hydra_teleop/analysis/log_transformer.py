@@ -1,264 +1,186 @@
 #!/usr/bin/env python3
 """
-hydra_teleop.tools.log_to_csv
+Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
 
-Convert Hydra JSON-lines logs into a per-run CSV summary.
+- Detects run boundaries as: collect EVENTS up to hydra_teleop.teleop STOP,
+  then emits a row on the immediately following hydra_teleop.main {reached, elapsed}.
+- Requires at least one EVENT in the run (otherwise no row).
+- CSV columns (order preserved):
+    timestamp, strategy, reached, elapse_time, zone_violations, event_violated, events_handled, event_violations
 
-Public API:
-    log_transformer(in_path: Union[str, Path], out_path: Optional[Union[str, Path]] = None, logger=None) -> Path
-    summarize_lines(lines_iterable: Iterable[str]) -> List[Dict[str, Any]]
+Input/Output are taken **only** from TeleopConfig:
+    - cfg.log_path: path to the input JSON log (required)
+    - cfg.results_csv_path: path to write the output CSV (required)
 
-A 'run' ends whenever the main process emits a record containing:
-    msg.reached (bool) and msg.elapsed (float)
-
-Between such run-terminator records, we count:
-    - events_handled
-    - events_success
-    - events_deadline_miss
-    - events_preemptive
-    - zone_violations
-
-CSV columns:
-    timestamp, strategy, reached, elapsed_time,
-    events_handled, events_success, events_deadline_miss,
-    events_preemptive, zone_violations
+No fallbacks, no guessing. If a required field is missing or the file does not exist, an exception is raised.
 """
 
 from __future__ import annotations
-import csv
-import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, List
+import json
+import csv
+from hydra_teleop.config import TeleopConfig
 
-MAIN_NAME_HINTS = (
-    "hydra_teleop.main",
-    ".main",        # e.g., "hydra_teleop.runner.main"
-    "main",         # fallback
-)
+# ---------- Shape helpers ----------
+def _is_stop(rec: Dict[str, Any]) -> bool:
+    return rec.get("name") == "hydra_teleop.teleop" and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
 
-# ----------------- Helpers: schema normalization -----------------
-
-def _get(obj: Dict[str, Any], *path, default=None):
-    cur = obj
-    try:
-        for p in path:
-            cur = cur[p]
-        return cur
-    except Exception:
-        return default
-
-def _is_from_main(obj: Dict[str, Any]) -> bool:
-    name = obj.get("name", "")
-    if not isinstance(name, str):
+def _is_main_terminator(rec: Dict[str, Any]) -> bool:
+    if rec.get("name") != "hydra_teleop.main":
         return False
-    return any(h in name for h in MAIN_NAME_HINTS)
+    msg = rec.get("msg")
+    return isinstance(msg, dict) and ("reached" in msg) and ("elapsed" in msg)
 
-def _is_reached_record(obj: Dict[str, Any]) -> bool:
-    msg = obj.get("msg")
-    if not isinstance(msg, dict):
-        return False
-    return ("reached" in msg) and ("elapsed" in msg) and _is_from_main(obj)
+def _is_zone_violation(rec: Dict[str, Any]) -> bool:
+    return rec.get("type") == "ZONEVIOLATION"
 
-def _extract_strategy(obj: Dict[str, Any]) -> str:
-    candidates = [
-        obj.get("strategy"),
-        _get(obj, "msg", "strategy"),
-        _get(obj, "extra", "strategy"),
-        _get(obj, "msg", "extra", "strategy"),
-    ]
-    for c in candidates:
-        if isinstance(c, str) and c.strip():
-            return c.strip()
-    return ""
+def _is_event(rec: Dict[str, Any]) -> bool:
+    return rec.get("type") == "EVENT" and rec.get("msg") == "EVENT" and isinstance(rec.get("payload"), dict)
 
-def _looks_like_event(obj: Dict[str, Any]) -> bool:
-    msg = obj.get("msg")
-    typ = obj.get("type") or (msg.get("type") if isinstance(msg, dict) else None)
-    if typ == "EVENT":
-        return True
-    if isinstance(msg, dict) and isinstance(msg.get("event"), str):
-        ev = msg["event"].upper()
-        return ev.startswith("EVENT_") or ev == "EVENT"
-    return False
-
-def _event_outcome_reason(obj: Dict[str, Any]):
-    msg = obj.get("msg", {})
-    if not isinstance(msg, dict):
-        return None, None
-
-    outcome = msg.get("outcome")
-    reason  = msg.get("reason")
-
-    ev = msg.get("event")
-    if isinstance(ev, str):
-        evu = ev.upper()
-        if evu == "EVENT_RESOLVED":
-            return "RESOLVED", "SUCCESS"
-        if evu == "EVENT_VIOLATION" and not reason:
-            return "VIOLATION", None
-
+def _event_outcome_is_success(payload: Dict[str, Any]) -> bool:
+    """
+    True if the EVENT outcome indicates a success (resolved),
+    False if it indicates a violation/failure.
+    """
+    outcome = payload.get("outcome")
+    if isinstance(outcome, bool):
+        return outcome
     if isinstance(outcome, str):
-        outcome = outcome.upper()
-    if isinstance(reason, str):
-        reason = reason.upper().replace("-", "_")
-
-    return outcome, reason
-
-ZONE_RE_STRINGS = (
-    "restricted zone",
-    "entered restricted zone",
-    "zone violation",
-    "no-fly",
-    "nfz",
-)
-
-def _looks_like_zone_violation(obj: Dict[str, Any]) -> bool:
-    msg = obj.get("msg")
-    typ = obj.get("type") or (msg.get("type") if isinstance(msg, dict) else None)
-    if isinstance(typ, str) and typ.upper() == "ZONEVIOLATION":
+        up = outcome.strip().upper()
+        if up in {"RESOLVED", "SUCCESS", "TRUE"}:
+            return True
+        if up in {"VIOLATION", "FAIL", "FALSE"}:
+            return False
+    reason = payload.get("reason")
+    if isinstance(reason, str) and reason.strip().upper() == "SUCCESS":
         return True
-
-    if isinstance(msg, dict):
-        reason = msg.get("reason") or ""
-        if isinstance(reason, str) and reason.upper().startswith("ZONE"):
-            return True
-
-    if isinstance(msg, str):
-        mlow = msg.lower()
-        if any(s in mlow for s in ZONE_RE_STRINGS):
-            return True
-
-    name = obj.get("name", "")
-    if isinstance(name, str) and "violation_counter" in name:
-        if isinstance(msg, str):
-            mlow = msg.lower()
-            if "violation" in mlow or "restricted zone" in mlow:
-                return True
-
     return False
 
-# ----------------- Core: summarize -----------------
+# ---------- Core transformer ----------
+@dataclass
+class TransformCfg:
+    input_log_path: str
+    output_csv_path: str
 
-def summarize_lines(lines_iterable: Iterable[str]) -> List[Dict[str, Any]]:
+def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
     """
-    Summarize JSON-lines records provided as an iterable of raw lines.
-    Returns a list of row dicts ready to be written to CSV.
+    Transform a structured JSON log into an experiment summary CSV.
+    Raises if input file is missing.
     """
+    in_path = Path(cfg.input_log_path)
+    out_path = Path(cfg.output_csv_path)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"[log_transformer] Input log not found: {in_path}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current = {
+        "events_handled": 0,
+        "event_violations": 0,
+        "zone_violations": 0,
+        "saw_any_event": False,
+        "run_closed": False,  # becomes True at STOP; emit on next MAIN reached
+    }
     rows: List[Dict[str, Any]] = []
 
-    counts = {
-        "events_total": 0,
-        "events_success": 0,
-        "events_deadline_miss": 0,
-        "events_preemptive": 0,
-        "zone_violations": 0,
-    }
+    def reset_counters():
+        current["events_handled"] = 0
+        current["event_violations"] = 0
+        current["zone_violations"] = 0
+        current["saw_any_event"] = False
+        current["run_closed"] = False
 
-    def reset_counts():
-        for k in counts:
-            counts[k] = 0
+    with in_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                # skip non-JSON noise lines
+                continue
 
-    for line in lines_iterable:
-        line = (line or "").strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            # Skip malformed lines silently (or log if desired)
-            continue
+            if _is_zone_violation(rec):
+                current["zone_violations"] += 1
+                continue
 
-        # Count events
-        if _looks_like_event(obj):
-            counts["events_total"] += 1
-            outcome, reason = _event_outcome_reason(obj)
-            if (outcome == "RESOLVED") and (reason in {None, "SUCCESS", "RESOLVED"}):
-                counts["events_success"] += 1
-            elif outcome == "VIOLATION":
-                if reason == "DEADLINE_MISS":
-                    counts["events_deadline_miss"] += 1
-                elif reason in {"PREEMPTIVE", "PREEMPTED", "PREMPTIVE", "PRE_EMPTIVE"}:
-                    counts["events_preemptive"] += 1
+            if _is_event(rec):
+                current["saw_any_event"] = True
+                payload = rec["payload"]
+                if _event_outcome_is_success(payload):
+                    current["events_handled"] += 1
+                else:
+                    current["event_violations"] += 1
+                continue
 
-        # Count zone violations
-        elif _looks_like_zone_violation(obj):
-            counts["zone_violations"] += 1
+            if _is_stop(rec):
+                current["run_closed"] = True
+                continue
 
-        # On run-terminator, emit one row and reset
-        if _is_reached_record(obj):
-            msg = obj.get("msg", {})
-            row = {
-                "timestamp": obj.get("ts") or obj.get("@timestamp") or "",
-                "strategy": _extract_strategy(obj),
-                "reached": bool(msg.get("reached")),
-                "elapsed_time": (float(msg.get("elapsed")) if msg.get("elapsed") is not None else ""),
-                "events_handled": counts["events_total"],
-                "events_success": counts["events_success"],
-                "events_deadline_miss": counts["events_deadline_miss"],
-                "events_preemptive": counts["events_preemptive"],
-                "zone_violations": counts["zone_violations"],
-            }
-            rows.append(row)
-            reset_counts()
+            if _is_main_terminator(rec) and current["run_closed"]:
+                # Only emit a row if we actually saw an EVENT this run
+                if current["saw_any_event"]:
+                    ts = rec.get("ts")
+                    msg = rec.get("msg", {})
+                    strategy = rec.get("strategy")
+                    row = {
+                        "timestamp": ts,
+                        "strategy": strategy,
+                        "reached": bool(msg.get("reached")),
+                        "elapse_time": float(msg.get("elapsed", 0.0)),
+                        "zone_violations": int(current["zone_violations"]),
+                        "event_violated": current["event_violations"] > 0,
+                        "events_handled": int(current["events_handled"]),
+                        "event_violations": int(current["event_violations"]),
+                    }
+                    rows.append(row)
+                reset_counters()
+                continue
 
-    return rows
-
-def _write_csv(rows: List[Dict[str, Any]], out_path: Path) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
+    # Write CSV in fixed column order
+    cols = [
         "timestamp",
         "strategy",
         "reached",
-        "elapsed_time",
-        "events_handled",
-        "events_success",
-        "events_deadline_miss",
-        "events_preemptive",
+        "elapse_time",
         "zone_violations",
+        "event_violated",
+        "events_handled",
+        "event_violations",
     ]
-    with out_path.open("w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    return out_path
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
-def log_transformer(
-    in_path: Union[str, Path],
-    out_path: Optional[Union[str, Path]] = None,
-    logger=None
-) -> Path:
+    return rows
+
+# ---------- Public entrypoint: STRICT TeleopConfig ----------
+def run_from_cfg() -> List[Dict[str, Any]]:
     """
-    Read a JSON-lines log from disk and write the per-run CSV.
-    Returns the output CSV Path.
+    Read required paths from TeleopConfig only. No fallbacks.
+    Required TeleopConfig attributes:
+      - log_path: str (path to input JSON log)
+      - results_csv_path: str (path to output CSV)
     """
-    in_path = Path(in_path)
-    if out_path is None:
-        out_path = in_path.with_name("experiment_reached_summary.csv")
-    out_path = Path(out_path)
+    cfg = TeleopConfig()
 
-    if not in_path.exists():
-        raise FileNotFoundError(f"Input log not found: {in_path}")
+    # Validate presence & types
+    if not hasattr(cfg, "log_path") or not isinstance(cfg.log_path, str) or not cfg.log_path:
+        raise AttributeError("TeleopConfig must define a non-empty string 'log_path' (input JSON log path).")
+    if not hasattr(cfg, "results_csv_path") or not isinstance(cfg.results_csv_path, str) or not cfg.results_csv_path:
+        raise AttributeError("TeleopConfig must define a non-empty string 'results_csv_path' (output CSV path).")
+    
+    return transform(TransformCfg(
+        input_log_path=cfg.log_path,
+        output_csv_path=cfg.results_csv_path,
+    ))
 
-    with in_path.open("r", encoding="utf-8") as f:
-        rows = summarize_lines(f)
-
-    _write_csv(rows, out_path)
-    if logger:
-        try:
-            logger.info(
-                {"event": "CSV_WRITTEN", "type": "RUN_SUMMARY", "rows": len(rows), "path": str(out_path)}
-            )
-        except Exception:
-            # don't break main just because logger failed
-            pass
-    return out_path
-
-# Optional CLI (kept for convenience)
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Hydra teleop: convert JSON-lines logs to per-run CSV.")
-    ap.add_argument("--in", dest="in_path", required=True, help="Path to JSON-lines log (e.g., run_logs.json)")
-    ap.add_argument("--out", dest="out_path", required=False, help="Output CSV path (default: experiment_reached_summary.csv next to input)")
-    args = ap.parse_args()
-    path = log_transformer(args.in_path, args.out_path)
-    print(f"Wrote summary → {path}")
+    # Strict: will raise if TeleopConfig/paths are not correct
+    run_from_cfg()
