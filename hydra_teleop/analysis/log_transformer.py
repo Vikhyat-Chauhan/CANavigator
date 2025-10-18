@@ -24,8 +24,9 @@ import csv
 from hydra_teleop.config import TeleopConfig
 
 # ---------- Shape helpers ----------
-def _is_stop(rec: Dict[str, Any]) -> bool:
-    return rec.get("name") == "hydra_teleop.teleop" and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
+def _is_stop(rec):
+    ok_name = rec.get("name") in ("hydra_teleop.navigation.teleop")
+    return ok_name and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
 
 def _is_main_terminator(rec: Dict[str, Any]) -> bool:
     if rec.get("name") != "hydra_teleop.main":

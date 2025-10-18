@@ -26,7 +26,7 @@ from .tools.bridge import start_parameter_bridge
 from .tools.violations import start_violation_monitor
 from .tools.nofly_generator import NoFlyGenerator, NoFlyGenCfg
 from .tools.target_generator import TargetGenerator, TargetGenCfg
-from .tools.event_emitter import EventEmitter, EventCfg
+from .tools.event_emitter import EventEmitter
 from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
 from .analysis.log_transformer import run_from_cfg
 from .analysis.statistics_analyzer import run_analysis
@@ -35,8 +35,7 @@ from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
 def _run_one_strategy(
     strategy_name: str,
     ctrl: GzTeleop,
-    cfg: TeleopConfig,
-    timeout_s: float
+    cfg: TeleopConfig
 ) -> Tuple[bool, Optional[float], int]:
     """
     Start a fresh sim, run a navigator to target (with timeout), collect results.
@@ -47,7 +46,7 @@ def _run_one_strategy(
     try:
         sim = start_sim(cfg)
         nav = LidarTargetNavigatorTROOP(ctrl, cfg, strategy_name)
-        reached, elapsed = nav.go_to(timeout_s=timeout_s)
+        reached, elapsed = nav.go_to(timeout_s=cfg.simulation_timeout)
         return reached, elapsed
     finally:
         # Try to shut down navigator even if construction failed mid-way
@@ -122,22 +121,18 @@ def main() -> None:
         target_gen = TargetGenerator(cfg, TargetGenCfg())
 
         # Violation monitor
-        violation_monitor = start_violation_monitor(zone_padding_m=0, corner_margin_m=0.5)
+        start_violation_monitor(zone_padding_m=0, corner_margin_m=0.5)
 
-        # --- Experiment control ---
-        N_REPEATS = 2
-        TIMEOUT_S = 300
-        
-        for i in range(N_REPEATS):
+        for i in range(cfg.simulation_runs):
             run_idx = i + 1
             print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
 
             # Regenerate NFZ and target every run
-            nofly_gen.run()
-            target_gen.run()
+            #nofly_gen.run()
+            #target_gen.run()
             # ---------------- TROOP ----------------
             for strategy in (cfg.analyzer_strategies):
-                reached, elapsed = _run_one_strategy(strategy, ctrl, cfg, TIMEOUT_S)
+                reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
                 logger.info({
                                 "reached" : reached,
                                 "elapsed" : elapsed
