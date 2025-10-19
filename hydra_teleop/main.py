@@ -119,17 +119,16 @@ def main() -> None:
         # Generators (No-fly + Target)
         nofly_gen = NoFlyGenerator(cfg, NoFlyGenCfg())
         target_gen = TargetGenerator(cfg, TargetGenCfg())
-
+        # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
+        nofly_gen.run()
+        target_gen.run()
+        
         # Violation monitor
         start_violation_monitor(zone_padding_m=0, corner_margin_m=0.5)
-
         for i in range(cfg.simulation_runs):
             run_idx = i + 1
             print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
 
-            # Regenerate NFZ and target every run
-            #nofly_gen.run()
-            #target_gen.run()
             # ---------------- TROOP ----------------
             for strategy in (cfg.analyzer_strategies):
                 reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
@@ -140,7 +139,9 @@ def main() -> None:
                             extra = {
                                 "strategy" : strategy
                             })  
-
+            # Regenerate NFZ and target every run
+            nofly_gen.run()
+            target_gen.run()
     finally:
         # Teardown in reverse order of startup
         try:

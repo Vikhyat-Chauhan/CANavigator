@@ -830,16 +830,14 @@ class LidarTargetNavigatorTROOP:
 
             # ---------- Event window: safety bump + choose best-ready plan ----------
             if event_active:
-                # temporary safety & speed caps during event handling
+                # ---------- Event window: safety bump + choose best-ready plan ----------
                 effective_safe_m += self._edc.safe_inflate_m
                 v_cmd = min(v_cmd, self._edc.v_cap_frac * self._gc.max_v)
 
                 tl = _evt_time_left()
-
-                # If deadline passed and we never applied an event plan -> violation
+                
+                # If deadline passed, simply drop/clear the event (no violation logging)
                 if tl <= 0.0:
-                    if not self._evt_resolved:
-                        self._evt_violate("DEADLINE_MISS")
                     self._evt_clear()
                 else:
                     # Choose target APE by time-left

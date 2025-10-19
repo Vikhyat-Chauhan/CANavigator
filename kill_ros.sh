@@ -34,9 +34,7 @@ PATTERNS=(
   "gzserver"
   "gz sim"
   "ignition"
-  "rqt"
-  "roscore"     # ROS 1 legacy
-  "rosmaster"   # ROS 1 legacy
+  "rqt"=
 )
 
 # Find PIDs for a single pattern (owned by TARGET_USER)

@@ -6,12 +6,12 @@ from typing import Optional, Tuple, List
 @dataclass
 class TeleopConfig:
     # --- Run Options ---
-    simulation_runs = 0
+    simulation_runs = 200
     simulation_timeout = 200
     # --- Sim / world ---
     world_path: str = "/home/vikhyat-chauhan/Documents/Hydra/worlds/airport_world.sdf"
-    #sim_cmd: tuple[str, ...] = ("gz", "sim", "-r")  # GUI
-    sim_cmd: tuple[str, ...] = ("gz", "sim", "4", "-s", "-r")  # headless
+    sim_cmd: tuple[str, ...] = ("gz", "sim", "-r")  # GUI
+    #sim_cmd: tuple[str, ...] = ("gz", "sim", "4", "-s", "-r")  # headless
     sim_env: dict | None = None
     sim_boot_secs: float = 8.0
     # --- Gazebo transport ---

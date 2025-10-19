@@ -48,8 +48,8 @@ class NoFlyGenCfg:
     cell_m: float = CELL_M
 
     # --- Two types: legacy vs custom height ---
-    custom_count: int = -1          # if >0, use exact count; else use custom_frac
-    custom_frac: float = 0.2        # fraction in [0,1] if custom_count <= 0
+    custom_count: int = 0          # if >0, use exact count; else use custom_frac
+    custom_frac: float = 0.0        # fraction in [0,1] if custom_count <= 0
 
     # Custom height is defined relative to a plane:
     ground_z: float = 0.0           # plane Z
@@ -160,6 +160,7 @@ class NoFlyGenerator:
         if self.cfg.custom_count and self.cfg.custom_count > 0:
             k = min(int(self.cfg.custom_count), n)
         else:
+            # This path generates boxs with unifrom height
             f = max(0.0, min(1.0, float(self.cfg.custom_frac)))
             k = int(round(f * n))
         if k <= 0:

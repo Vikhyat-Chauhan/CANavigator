@@ -114,7 +114,7 @@ class EventEmitter(Node):
             os.makedirs(os.path.dirname(self._cfg.log_csv_path) or ".", exist_ok=True)
             self._csv_fp = open(self._cfg.log_csv_path, "w", newline="")
             self._csv = csv.writer(self._csv_fp)
-            self._csv.writerow(["t_emit", "kind", "delta_t_s", "deadline_s", "meta_json"])
+            self._csv.writerow(["t_emit", "kind", "deadline_s", "meta_json"])
 
     # ---------------- Lifecycle ----------------
     def start(self):
@@ -187,14 +187,13 @@ class EventEmitter(Node):
         obj = {
             "kind": kind,
             "t_emit": time.time(),
-            "delta_t_s": delta_t,
             "deadline_s": derived_deadline,
             "meta": meta,
         }
         msg = String(); msg.data = json.dumps(obj)
         self._pub.publish(msg)
         if self._csv_fp:
-            self._csv.writerow([obj["t_emit"], kind, delta_t, obj["deadline_s"], json.dumps(meta)])
+            self._csv.writerow([obj["t_emit"], kind, obj["deadline_s"], json.dumps(meta)])
 
     def _emit_enemy(self, delta_t: float):
         pose = self._get_pose_xyyaw()
