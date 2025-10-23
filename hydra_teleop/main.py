@@ -68,8 +68,9 @@ def main() -> None:
     cfg = TeleopConfig()
     logcfg = AsyncLoggerCfg(
         logfile=cfg.log_path,
+        max_bytes=0, # disables rotation
         queue_maxsize=8000,
-        drop_on_full=True,
+        drop_on_full=False,
         console=False,
         level=logging.INFO,
         monitor_interval_s=10.0,
