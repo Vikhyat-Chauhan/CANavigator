@@ -146,7 +146,7 @@ class EventDecisionCfg:
     ape3_budget_ms: int = 90   # a hair more for quality; still practical
 
     # Safety bumps during event handling
-    safe_inflate_m: float = 0.5
+    safe_inflate_m: float = 0.8
     v_cap_frac: float = 0.75
     # Urgency guard: if time-left < guard, commit to first-ready in target lane
     commit_guard_s: float = 0.0
@@ -303,7 +303,6 @@ class LidarTargetNavigatorTROOP:
                   v_cap_frac=self._edc.v_cap_frac,
                   safe_inflate_m=self._edc.safe_inflate_m,
                   selector_mode=self._edc.selector_mode)
-        
 
         self._node_evt   = _EventSub(getattr(cfg, "event_topic", self._edc.event_topic))
 
@@ -346,6 +345,9 @@ class LidarTargetNavigatorTROOP:
         # single-event flags
         self._evt_active: bool = False          # exactly one active event
         self._evt_resolved: bool = False        # did we apply an event plan before deadline?
+
+        # NEW: one-time nav-start log guard
+        self._nav_start_logged: bool = False
 
     # ---------- tiny logging helper ----------
     def _log(self, msg: str, **fields):
@@ -544,34 +546,36 @@ class LidarTargetNavigatorTROOP:
         with self._evt_lock:
             self._evt_proposals[name] = {"v": v, "wz": wz, "vz": vz, "score": score, "ready_t": time.time()}
 
-    '''def _evt_plan_ape1(self, snap, budget_ms):
-        # Ultra-fast “duck”: decisive sidestep & brake
-        left, right = snap["left"], snap["right"]
-        v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
-        eps = self._sc.ambiguity_eps_m
-        pick_left = (left > right) if abs(left-right) >= eps else (self._side_bias > 0)
-        # stronger, short commit; keep within max_wz
-        turn = (+1.1 if pick_left else -1.1)
-        wz_cmd = max(-self._gc.max_wz, min(self._gc.max_wz, turn))
-        # brake more to guarantee clearance in tight TTC
-        v_cmd = min(v_cmd, 0.32 * self._gc.max_v)
-        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=0.0)'''
     def _evt_plan_ape1(self, snap, budget_ms):
-        # Minimal APE1: keep current speed, snap heading to safer side at max yaw rate.
+        """
+        APE1 (IMPULSIVE): minimal computation, quick reflex.
+        Behavior: snap yaw to safer side immediately, clamp speed hard, coarse TTC.
+        Complexity: O(1) (a few sector reads). No sleeping.
+        """
         left, right = snap["left"], snap["right"]
         v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
+        scan = snap["scan"]
 
-        eps = self._sc.ambiguity_eps_m
-        max_wz = self._gc.max_wz
+        # pick side (tie -> bias), then SNAP yaw at max rate
+        pick_left = (left > right) if abs(left - right) >= self._sc.ambiguity_eps_m else (self._side_bias > 0)
+        wz_cmd = (+self._gc.max_wz) if pick_left else (-self._gc.max_wz)
 
-        # Pick side (tie → use configured bias)
-        pick_left = (left > right) if abs(left - right) >= eps else (self._side_bias > 0)
+        # very conservative forward speed (impulsive brake-first behavior)
+        v_cmd = min(v_cmd, 0.30 * self._gc.max_v)
 
-        # Do NOT change forward/vertical speeds; only change direction sharply.
-        # Command max yaw toward the safer side.
-        wz_cmd = (+max_wz) if pick_left else (-max_wz)
+        # coarse TTC clamp using a tiny forward window (impulsive = short horizon)
+        dmin = float('inf')
+        if scan is not None:
+            w = _ScanSub._window_vals(scan, 0.0, max(4.0, self._ac.front_deg))
+            dmin = min(w) if w else float('inf')
+        v_cmd = self._stopping_limited_speed(v_cmd, dmin)
 
-        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=-999.0)
+        # slight nudge away from very near side wall (reactive “flinch”)
+        if min(left, right) < (2.0 * self._rc.vehicle_radius_m + 0.4):
+            wz_cmd += 0.25 if left < right else -0.25
+
+        # APE1 is intentionally crude -> worst reach times, but safest “instant evade”
+        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=-1e3)
 
     def _evt_plan_ape2(self, snap, budget_ms):
         # Local opening: sweep wider; prefer wide & aligned gaps
@@ -593,7 +597,7 @@ class LidarTargetNavigatorTROOP:
         hdr = math.radians(best_deg)
         yaw_goal = _wrap_pi(hdr)
         wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
-        v = min(snap["v_cmd"], 0.42 * self._gc.max_v)
+        v = min(snap["v_cmd"], 0.62 * self._gc.max_v)
         score = - (max(0.0, 6.0 - float(best_score)) + 0.3*abs(wz))  # prefer wide-ish + not too twisty
         self._evt_put("APE2", v, wz, snap["vz_cmd"], score)
 
@@ -669,6 +673,19 @@ class LidarTargetNavigatorTROOP:
             ex, ey, ez = (tx - x), (ty - y), (tz - z)
             dist_xy = math.hypot(ex, ey)
             dist = math.sqrt(ex*ex + ey*ey + ez*ez)
+
+            # ---- NEW: one-time POSES log before starting navigation ----
+            if not self._nav_start_logged:
+                self._log(
+                    "POSES",
+                    type="POSES",
+                    nav_start_drone_pose=(x, y, z, yaw),
+                    nav_start_target=(tx, ty, tz),
+                    nav_start_dist_m=round(dist, 3),
+                    nav_start_dist_xy_m=round(dist_xy, 3),
+                )
+                self._nav_start_logged = True
+
             if dist <= self._gc.goal_radius_m:
                 reached = True
                 break
@@ -830,7 +847,6 @@ class LidarTargetNavigatorTROOP:
 
             # ---------- Event window: safety bump + choose best-ready plan ----------
             if event_active:
-                # ---------- Event window: safety bump + choose best-ready plan ----------
                 effective_safe_m += self._edc.safe_inflate_m
                 v_cmd = min(v_cmd, self._edc.v_cap_frac * self._gc.max_v)
 

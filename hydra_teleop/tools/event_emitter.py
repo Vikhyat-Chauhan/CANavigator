@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/event_emitter.py (B-style)
+# hydra_teleop/event_emitter.py (B-style) — with reset() support
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -26,7 +26,7 @@ class EventCfg:
     # Optional fixed global deadline. If None, we derive per-event deadlines from Δt.
     global_deadline_s: Optional[float] = None
     # B-style: deadline = clamp( α * Δt , [deadline_min_s, deadline_max_s] )
-    deadline_alpha: float = 0.85
+    deadline_alpha: float = 0.80
     deadline_min_s: float = 0.12
     deadline_max_s: float = 1.2
 
@@ -106,7 +106,6 @@ class EventEmitter(Node):
         self._stop_flag = threading.Event()
         self._spin_thread: Optional[threading.Thread] = None
         self._exp_thread: Optional[threading.Thread] = None
-        self._stopped = False
 
         # CSV logging setup
         self._csv_fp = None
@@ -126,15 +125,43 @@ class EventEmitter(Node):
             self._exp_thread = threading.Thread(target=self._loop, daemon=True)
             self._exp_thread.start()
 
-    def stop(self):
+    def stop(self, destroy: bool = True):
+        """
+        Stop threads. If destroy=False, keep node/publisher and CSV open so we can reset().
+        """
         self._stop_flag.set()
-        if self._exp_thread: self._exp_thread.join(timeout=1.0)
-        if self._spin_thread: self._spin_thread.join(timeout=1.0)
-        if self._csv_fp:
-            self._csv_fp.flush(); self._csv_fp.close()
-            self._csv_fp.flush()
-        self._exec.remove_node(self)
-        self.destroy_node()
+        if self._exp_thread:
+            self._exp_thread.join(timeout=1.0)
+        if self._spin_thread:
+            self._spin_thread.join(timeout=1.0)
+        self._exp_thread = None
+        self._spin_thread = None
+
+        if destroy:
+            if self._csv_fp:
+                try:
+                    self._csv_fp.flush()
+                finally:
+                    self._csv_fp.close()
+                self._csv_fp = None
+            try:
+                self._exec.remove_node(self)
+            except Exception:
+                pass
+            self.destroy_node()
+
+    def reset(self):
+        """
+        Reset RNG to the initial seed and restart emission so the event sequence repeats.
+        Keeps the same ROS node, publisher, and CSV file.
+        """
+        # Stop threads but do not destroy node/pubs or close CSV
+        self.stop(destroy=False)
+        # Rewind RNG to the original seed so the random sequence repeats
+        self._rnd = random.Random(self._cfg.seed)
+        # Clear stop flag and restart threads
+        self._stop_flag.clear()
+        self.start()
 
     def _spin_loop(self):
         while rclpy.ok() and not self._stop_flag.is_set():

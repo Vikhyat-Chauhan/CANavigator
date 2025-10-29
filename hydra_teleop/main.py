@@ -78,7 +78,7 @@ def main() -> None:
     )
     log_handle = setup_async_logger(logcfg)
     logger = logging.getLogger("hydra_teleop.main")
-    logger.info("[LOGGING INITILIZED]")
+    print(f"\n=== [LOGGING INITILIZED] ===")
 
     # --- Bridges (pose + ROS↔GZ) ---
     pose_bridge = None
@@ -99,89 +99,93 @@ def main() -> None:
 
     # Results
     stats: List[Dict[str, Any]] = []
+    if(cfg.simulation_runs != 0):
+        try:
+            # Pose + ROS↔GZ bridges
+            pose_bridge = start_pose_bridge(["drone1", "target_sphere"])
+            # Parameter bridge lines (cmd_vel, lidar) for world
+            rosgz_bridge = start_parameter_bridge([
+                ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan"),
+                ("/model/drone1/cmd_vel", "geometry_msgs/msg/Twist", "gz.msgs.Twist"),
+            ])
 
-    try:
-        # Pose + ROS↔GZ bridges
-        pose_bridge = start_pose_bridge(["drone1", "target_sphere"])
-        # Parameter bridge lines (cmd_vel, lidar) for world
-        rosgz_bridge = start_parameter_bridge([
-            ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan"),
-            ("/model/drone1/cmd_vel", "geometry_msgs/msg/Twist", "gz.msgs.Twist"),
-        ])
+            # Start event emitter (separate executor thread)
+            emitter = EventEmitter(cfg)
+            emitter.start()
 
-        # Start event emitter (separate executor thread)
-        emitter = EventEmitter(cfg)
-        emitter.start()
-
-        # Velocity publisher
-        ctrl = GzTeleop(cfg.topic, cfg)
-        ctrl.start()
-        
-        # Generators (No-fly + Target)
-        nofly_gen = NoFlyGenerator(cfg, NoFlyGenCfg())
-        target_gen = TargetGenerator(cfg, TargetGenCfg())
-        # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
-        nofly_gen.run()
-        target_gen.run()
-        
-        # Violation monitor
-        start_violation_monitor(zone_padding_m=0, corner_margin_m=0.5)
-        for i in range(cfg.simulation_runs):
-            run_idx = i + 1
-            print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
-
-            # ---------------- TROOP ----------------
-            for strategy in (cfg.analyzer_strategies):
-                reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
-                logger.info({
-                                "reached" : reached,
-                                "elapsed" : elapsed
-                            },
-                            extra = {
-                                "strategy" : strategy
-                            })  
-            # Regenerate NFZ and target every run
+            # Velocity publisher
+            ctrl = GzTeleop(cfg.topic, cfg)
+            ctrl.start()
+            
+            # Generators (No-fly + Target)
+            nofly_gen = NoFlyGenerator(cfg, NoFlyGenCfg())
+            target_gen = TargetGenerator(cfg, TargetGenCfg())
+            # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
             nofly_gen.run()
             target_gen.run()
-    finally:
-        # Teardown in reverse order of startup
-        try:
-            if emitter is not None:
-                emitter.stop()
-        except Exception as e:
-            print(f"[hydra][WARN] emitter.stop() error: {e}")
+            
+            # Violation monitor
+            start_violation_monitor(zone_padding_m=-0.30, corner_margin_m=0.30)
+            for i in range(cfg.simulation_runs):
+                run_idx = i + 1
+                print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
+                # ---------------- TROOP ----------------
+                for strategy in (cfg.analyzer_strategies):
+                    # Event emitter will be resetted every run for now, to keep the sequence same for each isolated run. 
+                    # This will allow us to observe all APEs under same event load since the seed is fixed.
+                    emitter.reset()
+                    reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
+                    logger.info({
+                                    "reached" : reached,
+                                    "elapsed" : elapsed
+                                },
+                                extra = {
+                                    "strategy" : strategy
+                                })  
+                # Regenerate NFZ and target every run
+                nofly_gen.run()
+                target_gen.run()
+        finally:
+            # Teardown in reverse order of startup
+            try:
+                if emitter is not None:
+                    emitter.stop()
+            except Exception as e:
+                print(f"[hydra][WARN] emitter.stop() error: {e}")
 
-        try:
-            if ctrl is not None:
-                ctrl.stop()
-        except Exception as e:
-            print(f"[hydra][WARN] ctrl.stop() error: {e}")
+            try:
+                if ctrl is not None:
+                    ctrl.stop()
+            except Exception as e:
+                print(f"[hydra][WARN] ctrl.stop() error: {e}")
 
-        try:
-            if pose_bridge is not None:
-                pose_bridge.stop()
-        except Exception as e:
-            print(f"[hydra][WARN] pose_bridge.stop() error: {e}")
+            try:
+                if pose_bridge is not None:
+                    pose_bridge.stop()
+            except Exception as e:
+                print(f"[hydra][WARN] pose_bridge.stop() error: {e}")
 
-        try:
-            if rosgz_bridge is not None:
-                rosgz_bridge.stop()
-        except Exception as e:
-            print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
+            try:
+                if rosgz_bridge is not None:
+                    rosgz_bridge.stop()
+            except Exception as e:
+                print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
 
-        try:
-            if log_handle is not None:
-                log_handle.stop()
-        except Exception as e:
-            print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
+            try:
+                if log_handle is not None:
+                    log_handle.stop()
+            except Exception as e:
+                print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
+    else:
+        print(f"\n=== Simulations are 0, running in analysis mode only ===")
 
-        run_from_cfg()
-        result = run_analysis()
-        print(" Best strategy:", result["best_strategy"])
-        print(" Metrics:", result["metrics"])
-        print(" Summary CSV:", result["summary_csv"])
-        print(" 2D plot:", result["plot_2d"])
-        print(" 3D plot:", result["plot_3d"])
+    run_from_cfg()
+    result = run_analysis()
+    print(" Best strategy:", result["best_strategy"])
+    print(" Metrics:", result["metrics"])
+    print(" Summary CSV:", result["summary_csv"])
+    print(" 2D plot:", result["plot_2d"])
+    print(" 3D plot:", result["plot_3d"])
 
 if __name__ == "__main__":
     main()

@@ -11,6 +11,8 @@ Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
 Input/Output are taken **only** from TeleopConfig:
     - cfg.log_path: path to the input JSON log (required)
     - cfg.results_csv_path: path to write the output CSV (required)
+    - (optional) cfg.min_nav_start_dist_xy_m: float threshold; only emit rows for runs with
+      nav_start_dist_xy_m >= this value. If absent/None, no filtering is applied.
 
 No fallbacks, no guessing. If a required field is missing or the file does not exist, an exception is raised.
 """
@@ -18,15 +20,14 @@ No fallbacks, no guessing. If a required field is missing or the file does not e
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import json
 import csv
 from hydra_teleop.config import TeleopConfig
 
 # ---------- Shape helpers ----------
-def _is_stop(rec):
-    ok_name = rec.get("name") in ("hydra_teleop.navigation.teleop")
-    return ok_name and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
+def _is_stop(rec: Dict[str, Any]) -> bool:
+    return rec.get("name") == "hydra_teleop.navigation.teleop" and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
 
 def _is_main_terminator(rec: Dict[str, Any]) -> bool:
     if rec.get("name") != "hydra_teleop.main":
@@ -40,11 +41,11 @@ def _is_zone_violation(rec: Dict[str, Any]) -> bool:
 def _is_event(rec: Dict[str, Any]) -> bool:
     return rec.get("type") == "EVENT" and rec.get("msg") == "EVENT" and isinstance(rec.get("payload"), dict)
 
+def _is_nav_start(rec: Dict[str, Any]) -> bool:
+    # POSES line that carries nav-start distances
+    return rec.get("type") == "POSES" and rec.get("msg") == "POSES" and isinstance(rec.get("payload"), dict)
+
 def _event_outcome_is_success(payload: Dict[str, Any]) -> bool:
-    """
-    True if the EVENT outcome indicates a success (resolved),
-    False if it indicates a violation/failure.
-    """
     outcome = payload.get("outcome")
     if isinstance(outcome, bool):
         return outcome
@@ -64,12 +65,10 @@ def _event_outcome_is_success(payload: Dict[str, Any]) -> bool:
 class TransformCfg:
     input_log_path: str
     output_csv_path: str
+    # Optional distance filter: only emit rows when nav_start_dist_xy_m >= this threshold
+    min_nav_start_dist_xy_m: Optional[float] = None
 
 def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
-    """
-    Transform a structured JSON log into an experiment summary CSV.
-    Raises if input file is missing.
-    """
     in_path = Path(cfg.input_log_path)
     out_path = Path(cfg.output_csv_path)
 
@@ -78,12 +77,15 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    current = {
+    current: Dict[str, Any] = {
         "events_handled": 0,
         "event_violations": 0,
         "zone_violations": 0,
         "saw_any_event": False,
-        "run_closed": False,  # becomes True at STOP; emit on next MAIN reached
+        "run_closed": False,            # becomes True at STOP; emit on next MAIN reached
+        "nav_seen": False,              # must see POSES before emitting a row
+        "nav_start_dist_m": None,       # from POSES
+        "nav_start_dist_xy_m": None,    # from POSES
     }
     rows: List[Dict[str, Any]] = []
 
@@ -93,6 +95,9 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
         current["zone_violations"] = 0
         current["saw_any_event"] = False
         current["run_closed"] = False
+        current["nav_seen"] = False
+        current["nav_start_dist_m"] = None
+        current["nav_start_dist_xy_m"] = None
 
     with in_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -102,7 +107,21 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
             try:
                 rec = json.loads(line)
             except Exception:
-                # skip non-JSON noise lines
+                continue
+
+            # Required single POSES before nav per run (your guarantee)
+            if _is_nav_start(rec):
+                payload = rec["payload"]
+                # direct parse; raise if missing since you guaranteed presence
+                try:
+                    current["nav_start_dist_xy_m"] = float(payload["nav_start_dist_xy_m"])
+                except Exception:
+                    raise ValueError(f"[log_transformer] POSES missing 'nav_start_dist_xy_m' at ts={rec.get('ts')}")
+                try:
+                    current["nav_start_dist_m"] = float(payload["nav_start_dist_m"])
+                except Exception:
+                    raise ValueError(f"[log_transformer] POSES missing 'nav_start_dist_m' at ts={rec.get('ts')}")
+                current["nav_seen"] = True
                 continue
 
             if _is_zone_violation(rec):
@@ -123,8 +142,23 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                 continue
 
             if _is_main_terminator(rec) and current["run_closed"]:
-                # Only emit a row if we actually saw an EVENT this run
+                # We require: at least one EVENT and the POSES record
                 if current["saw_any_event"]:
+                    if not current["nav_seen"]:
+                        raise RuntimeError("[log_transformer] Run reached terminator without prior POSES line (nav_start).")
+
+                    # --- Distance filter applied here ---
+                    if cfg.min_nav_start_dist_xy_m is not None:
+                        nav_dist = current["nav_start_dist_xy_m"]
+                        # If nav_dist is missing, earlier code would have raised. Just be explicit:
+                        if nav_dist is None:
+                            raise RuntimeError("[log_transformer] Missing nav_start_dist_xy_m when applying distance filter.")
+                        if nav_dist < float(cfg.min_nav_start_dist_xy_m):
+                            # Skip emission for this run but still reset counters for the next run.
+                            reset_counters()
+                            continue
+                    # -----------------------------------
+
                     ts = rec.get("ts")
                     msg = rec.get("msg", {})
                     strategy = rec.get("strategy")
@@ -133,6 +167,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                         "strategy": strategy,
                         "reached": bool(msg.get("reached")),
                         "elapse_time": float(msg.get("elapsed", 0.0)),
+                        "nav_start_dist_xy_m": current["nav_start_dist_xy_m"],
                         "zone_violations": int(current["zone_violations"]),
                         "event_violated": current["event_violations"] > 0,
                         "events_handled": int(current["events_handled"]),
@@ -142,12 +177,13 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                 reset_counters()
                 continue
 
-    # Write CSV in fixed column order
+    # Write CSV (order preserved)
     cols = [
         "timestamp",
         "strategy",
         "reached",
         "elapse_time",
+        "nav_start_dist_xy_m",
         "zone_violations",
         "event_violated",
         "events_handled",
@@ -163,25 +199,26 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
 
 # ---------- Public entrypoint: STRICT TeleopConfig ----------
 def run_from_cfg() -> List[Dict[str, Any]]:
-    """
-    Read required paths from TeleopConfig only. No fallbacks.
-    Required TeleopConfig attributes:
-      - log_path: str (path to input JSON log)
-      - results_csv_path: str (path to output CSV)
-    """
     cfg = TeleopConfig()
 
-    # Validate presence & types
     if not hasattr(cfg, "log_path") or not isinstance(cfg.log_path, str) or not cfg.log_path:
         raise AttributeError("TeleopConfig must define a non-empty string 'log_path' (input JSON log path).")
     if not hasattr(cfg, "results_csv_path") or not isinstance(cfg.results_csv_path, str) or not cfg.results_csv_path:
         raise AttributeError("TeleopConfig must define a non-empty string 'results_csv_path' (output CSV path).")
-    
+
+    # Optional threshold; accept None if absent
+    min_xy = None
+    if hasattr(cfg, "min_nav_start_dist_xy_m") and cfg.min_nav_start_dist_xy_m is not None:
+        try:
+            min_xy = float(cfg.min_nav_start_dist_xy_m)
+        except Exception:
+            raise TypeError("TeleopConfig.min_nav_start_dist_xy_m must be a float if provided.")
+
     return transform(TransformCfg(
         input_log_path=cfg.log_path,
         output_csv_path=cfg.results_csv_path,
+        min_nav_start_dist_xy_m=min_xy,
     ))
 
 if __name__ == "__main__":
-    # Strict: will raise if TeleopConfig/paths are not correct
     run_from_cfg()
