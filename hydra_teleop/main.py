@@ -133,6 +133,7 @@ def main() -> None:
                 for strategy in (cfg.analyzer_strategies):
                     # Event emitter will be resetted every run for now, to keep the sequence same for each isolated run. 
                     # This will allow us to observe all APEs under same event load since the seed is fixed.
+                    print(f"\n=== Hydra Experiment Strategy {strategy} ===")
                     emitter.reset()
                     reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
                     logger.info({
@@ -178,7 +179,7 @@ def main() -> None:
                 print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
     else:
         print(f"\n=== Simulations are 0, running in analysis mode only ===")
-
+    
     run_from_cfg()
     result = run_analysis()
     print(" Best strategy:", result["best_strategy"])

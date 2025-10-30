@@ -115,4 +115,9 @@ fi
 #python3 "$PY_TARGEN_SCRIPT" # <- removed --seed 42 to randomize
 
 echo "==> 6) Running controller module"
-python3 -m "hydra_teleop.main"
+RUNS=20
+for i in $(seq 1 "$RUNS"); do
+  echo "==> [Run $i/$RUNS]"
+  python3 -m "hydra_teleop.main" "$@"
+  ./kill_ros.sh
+done
