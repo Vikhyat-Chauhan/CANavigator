@@ -74,8 +74,8 @@ class SafetyCfg:
     ambiguity_eps_m: float = 0.5     # |left-right| < eps => ambiguous
 
     # TTC braking (distance / forward_speed)
-    ttc_soft_s: float = 1.6          # start slowing under this TTC
-    ttc_hard_s: float = 1.0          # hard clamp under this TTC
+    ttc_soft_s: float = 2.2          # start slowing under this TTC
+    ttc_hard_s: float = 1.4          # hard clamp under this TTC
     v_min_frac: float = 0.20         # never go below this * max_v (unless escaping)
 
     # Cap turn-rate when any obstacle is close
@@ -96,12 +96,12 @@ class SafetyCfg:
     crumb_oscillations_to_flip: int = 12
 
     # Command shaping (prevents “launch into wall”)
-    dv_max_mps_per_s: float = 10.0    # base cap on linear speed change rate
+    dv_max_mps_per_s: float = 6.0    # base cap on linear speed change rate
     jw_max_radps2: float = 3.0       # cap on yaw-rate change per second
 
     # Gentler accel when heading is “empty” (clear & aligned)
-    clear_ahead_thresh_m: float = 12.0  # forward clearance considered "empty"
-    dv_clear_scale: float = 0.5         # fraction of normal accel when empty
+    clear_ahead_thresh_m: float = 16.0  # forward clearance considered "empty"
+    dv_clear_scale: float = 0.35         # fraction of normal accel when empty
     yaw_align_rad: float = 0.25         # slow accel if |wz_cmd| <= this
 
 # ===== LiDAR-aware & ML risk tuning (optional) =====
@@ -109,8 +109,8 @@ class SafetyCfg:
 class RiskCfg:
     # Vehicle / physics for stopping-distance rule
     vehicle_radius_m: float = 0.7
-    max_decel_mps2: float = 6.0
-    stop_margin_m: float = 1.0
+    max_decel_mps2: float = 4.5
+    stop_margin_m: float = 2.0
 
     # Corridor / doorway logic
     gate_half_deg: float = 12.0     # +/- sector to estimate “doorway” width
@@ -650,7 +650,8 @@ class LidarTargetNavigatorTROOP:
         dt = 1.0 / rate
         t_start = time.time()
         reached = False
-
+        self._teleop.start()
+        
         while True:
             dpose = self._latest_drone()
             if dpose is None:
@@ -1019,6 +1020,6 @@ class LidarTargetNavigatorTROOP:
 
         # stop/hold
         self._teleop.stop()
-        time.sleep(max(0.05, 2.0 / max(1.0, float(getattr(self._cfg, "rate_hz", 30.0)))))
+        time.sleep(max(0.05, 2.0 / max(1.0, self._cfg.rate_hz)))
         elapsed = time.time() - t_start
         return reached, elapsed

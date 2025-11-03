@@ -122,6 +122,7 @@ class GzTeleop:
                             "event" : "STOP"
                         })
         self.set_cmd(0.0, 0.0, 0.0, 0.0)
+        self._physics.reset()
 
     def shutdown(self, join_timeout: float = 0.3) -> None:
         # Zero commands and publish a final zero

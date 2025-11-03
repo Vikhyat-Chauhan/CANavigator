@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # hydra_teleop/violations.py
-# Violation checker: adjustable padding and corner exclusion (rounded corners).
-# Counts a violation when inside a padded rectangle BUT NOT within corner_margin_m
-# of any rectangle corner (reduces corner-graze false positives).
+# Deep-penetration NFZ violations (no ENTER/EXIT events, no padding):
+# - Loads axis-aligned rectangles (cx, cy, w, h) from generated_nofly_meta.json
+# - Logs ZONEVIOLATION once per visit when depth >= deep_margin_m for at least dwell_s
+# - One-time LOADEDBOXES record at startup
+#
+# Tunables:
+#   deep_margin_m : required depth inside the rectangle (meters) to count as "too deep"
+#   dwell_s       : required continuous time spent deeper than deep_margin_m before violation
+#   min_step_m    : ignore pose updates with near-zero motion (noise debounce)
 
-import json, os, threading
+import json, os, threading, math, time
+from typing import List, Tuple, Optional
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
@@ -13,128 +20,180 @@ import logging
 META_PATH = os.path.join("models", "generated", "generated_nofly_meta.json")
 
 
-def load_rects(meta_path):
-    """Load list of (cx, cy, w, h) rectangles from JSON metadata."""
-    with open(meta_path) as f:
+def load_rects(meta_path: str) -> List[Tuple[float, float, float, float]]:
+    """Return list of rectangles as (cx, cy, w, h) from meta JSON."""
+    with open(meta_path, "r") as f:
         meta = json.load(f)
-    return [tuple(map(float, r)) for r in meta.get("rectangles_xywh", [])]
+    rects = meta.get("rectangles_xywh", [])
+    return [tuple(map(float, r)) for r in rects]
 
 
-def inside_rect_rounded(x, y, cx, cy, w, h, pad=0.0, corner_r=0.0):
+def _now_from_msg_or_clock(node: Node, msg: Optional[PoseStamped]) -> float:
+    """Seconds (float). Prefer msg.header.stamp; fallback to ROS clock; then time.time()."""
+    try:
+        if msg is not None and msg.header.stamp:
+            return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+    except Exception:
+        pass
+    try:
+        return node.get_clock().now().nanoseconds * 1e-9
+    except Exception:
+        return time.time()
+
+
+def point_in_rect(x: float, y: float, cx: float, cy: float, w: float, h: float) -> bool:
+    """Axis-aligned membership (no padding)."""
+    half_w = max(0.0, w * 0.5)
+    half_h = max(0.0, h * 0.5)
+    return (cx - half_w) <= x <= (cx + half_w) and (cy - half_h) <= y <= (cy + half_h)
+
+
+def rect_depth_inside(x: float, y: float, cx: float, cy: float, w: float, h: float) -> float:
     """
-    Return True if (x,y) is inside a rectangle centered at (cx,cy) with size (w,h),
-    inflated by 'pad' on each side, *excluding* rounded corners of radius corner_r.
-
-    corner_r == 0 -> plain padded rectangle (legacy behavior).
+    Signed "depth" (meters) relative to rectangle boundary (no padding).
+      > 0  : inside; value = min distance to the nearest side
+      = 0  : exactly on boundary
+      < 0  : outside; magnitude = how far to cross the boundary
     """
-    # Effective (possibly inflated) rectangle dimensions
-    W = max(0.0, w + 2.0 * pad)
-    H = max(0.0, h + 2.0 * pad)
-
-    # Translate to rect-centered coordinates
-    dx = abs(x - cx)
-    dy = abs(y - cy)
-
-    # First, must be inside the padded axis-aligned rectangle
-    if dx > W / 2.0 or dy > H / 2.0:
-        return False
-
-    # If no corner rounding requested, done.
-    if corner_r <= 0.0:
-        return True
-
-    # Exclude near-corner region: treat each corner as a quarter circle of radius corner_r
-    # with centers at (±W/2, ±H/2). If the point lies within any quarter circle, reject.
-    # Compute distance to the nearest corner in the first quadrant using symmetry.
-    # (dx, dy) are non-negative due to abs above.
-    ddx = max(0.0, (W / 2.0) - dx)  # distance from inside point to vertical edge (inward)
-    ddy = max(0.0, (H / 2.0) - dy)  # distance from inside point to horizontal edge (inward)
-
-    # When close to a corner, both ddx and ddy are small. Distance to the corner inside
-    # the rectangle is sqrt((W/2 - dx)^2 + (H/2 - dy)^2).
-    dist2_corner = ((W / 2.0) - dx) ** 2 + ((H / 2.0) - dy) ** 2
-
-    # If the point is within the corner radius of the true corner, exclude it.
-    # (This effectively "rounds" the rectangle by cutting out quarter circles.)
-    return dist2_corner > (corner_r ** 2)
+    half_w = max(0.0, w * 0.5)
+    half_h = max(0.0, h * 0.5)
+    dx = half_w - abs(x - cx)
+    dy = half_h - abs(y - cy)
+    return min(dx, dy)
 
 
-class ViolationCounter(Node):
+class ViolationMonitor(Node):
+    """
+    Subscribes to drone pose, detects:
+      - ZONEVIOLATION once per visit when depth_inside >= deep_margin_m for ≥ dwell_s
+    """
+
     def __init__(
         self,
-        pose_topic="/model/drone1/pose/info",
-        meta_path=META_PATH,
-        zone_padding_m=0.0,
-        corner_margin_m=0.25,  # NEW: radius of rounded corner cutouts
+        pose_topic: str = "/model/drone1/pose/info",
+        meta_path: str = META_PATH,
+        deep_margin_m: float = 1.0,     # how deep into the rect to count as violation
+        dwell_s: float = 0.15,          # must remain deeper than deep_margin_m for this duration
+        min_step_m: float = 1e-3,       # ignore tiny jitter steps
     ):
-        super().__init__("violation_counter")
-        # Get Logger 
+        super().__init__("violation_monitor")
+
+        # Python logger (uses your existing logging format/handlers)
         self._logger = logging.getLogger(__name__)
 
-        # Allow tuning via ROS params or constructor args (constructor defaults shown above).
-        self.declare_parameter("zone_padding_m", zone_padding_m)
-        self.declare_parameter("corner_margin_m", corner_margin_m)
+        # ROS params (constructor defaults are picked up if params not provided)
+        self.declare_parameter("deep_margin_m", deep_margin_m)
+        self.declare_parameter("dwell_s", dwell_s)
+        self.declare_parameter("min_step_m", min_step_m)
 
-        # Clamp to non-negative; stricter only.
-        self._pad = max(0.0, float(self.get_parameter("zone_padding_m").value))
-        self._corner_r = max(0.0, float(self.get_parameter("corner_margin_m").value))
+        self._deep = max(0.0, float(self.get_parameter("deep_margin_m").value))
+        self._dwell = max(0.0, float(self.get_parameter("dwell_s").value))
+        self._min_step = max(0.0, float(self.get_parameter("min_step_m").value))
 
         self._rects = load_rects(meta_path)
-        self._inside_any = False
+        n = len(self._rects)
 
-        self.create_subscription(PoseStamped, pose_topic, self._on_pose, 10)
-        self._logger.info({
-                            "boxes" : len(self._rects),
-                            "zone_padding" : round(self._pad,3),
-                            "corner_margin" : round(self._corner_r,3)
-                        },
-                        extra = {
-                            "type" : "LOADEDBOXES"
-                        })  
+        # Per-rect state
+        self._armed = [True] * n                 # fire once per visit (re-armed on exit)
+        self._inside_prev = [False] * n          # previous inside status (no logs on transitions)
+        self._deep_since: List[Optional[float]] = [None] * n  # time when we first got deep this visit
 
-    def _on_pose(self, msg: PoseStamped):
-        x, y = msg.pose.position.x, msg.pose.position.y
-        in_zone = any(
-            inside_rect_rounded(x, y, cx, cy, w, h, pad=self._pad, corner_r=self._corner_r)
-            for (cx, cy, w, h) in self._rects
+        # Global state
+        self._prev_xy: Optional[Tuple[float, float]] = None
+
+        # Subscribe
+        self._sub = self.create_subscription(PoseStamped, pose_topic, self._on_pose, 20)
+
+        # Startup log
+        self._logger.info(
+            {
+                "boxes": n,
+                "deep_margin": round(self._deep, 3),
+                "dwell_s": round(self._dwell, 3),
+            },
+            extra={"type": "LOADEDBOXES"},
         )
 
-        # detect new entry (but ignore rounded-corner cutouts)
-        if in_zone and not self._inside_any:
-            self._logger.info({
-                            "x" : round(x, 2),
-                            "y" : round(y, 2)
-                        },
-                        extra = {
-                            "type" : "ZONEVIOLATION"
-                        })  
+    # --------------------- Callbacks ----------------------
+    def _on_pose(self, msg: PoseStamped):
+        x, y = msg.pose.position.x, msg.pose.position.y
+        t_now = _now_from_msg_or_clock(self, msg)
 
-        self._inside_any = in_zone
+        # Motion debounce (optional)
+        if self._prev_xy is not None:
+            if math.hypot(x - self._prev_xy[0], y - self._prev_xy[1]) < self._min_step:
+                # Still update per-rect state below; this just avoids overreacting to jitter
+                pass
+
+        # Per-rect checks (no ENTER/EXIT logs)
+        for i, (cx, cy, w, h) in enumerate(self._rects):
+            now_in = point_in_rect(x, y, cx, cy, w, h)
+
+            # On exit, re-arm and clear deep timer (but do not log)
+            if self._inside_prev[i] and not now_in:
+                self._armed[i] = True
+                self._deep_since[i] = None
+                self._inside_prev[i] = False
+                continue
+
+            self._inside_prev[i] = now_in
+
+            # Only consider when inside
+            if not now_in:
+                self._deep_since[i] = None
+                continue
+
+            # Depth relative to rectangle boundary
+            depth = rect_depth_inside(x, y, cx, cy, w, h)
+
+            # Not deep enough: reset deep timer
+            if depth < self._deep:
+                self._deep_since[i] = None
+                continue
+
+            # Deep enough: start/continue dwell timer
+            if self._deep_since[i] is None:
+                self._deep_since[i] = t_now
+
+            # If dwelled long enough and armed → fire once per visit
+            if self._armed[i] and (t_now - self._deep_since[i] >= self._dwell):
+                self._logger.info(
+                    {
+                        "rect_idx": i,
+                        "rect_center": {"x": round(cx, 3), "y": round(cy, 3)},
+                        "pose": {"x": round(x, 3), "y": round(y, 3)},
+                        "depth_m": round(depth, 3),
+                        "deep_margin_m": round(self._deep, 3),
+                        "dwell_s": round(self._dwell, 3),
+                    },
+                    extra={"type": "ZONEVIOLATION"},
+                )
+                # Disarm until we EXIT this rectangle
+                self._armed[i] = False
+
+        # Update last pose
+        self._prev_xy = (x, y)
+
 
 def start_violation_monitor(
-    pose_topic="/model/drone1/pose/info",
-    meta_path=META_PATH,
-    zone_padding_m=0.0,
-    corner_margin_m=0.25,
+    pose_topic: str = "/model/drone1/pose/info",
+    meta_path: str = META_PATH,
+    deep_margin_m: float = 1.0,
+    dwell_s: float = 0.15,
+    min_step_m: float = 1e-3,
 ):
     """
-    Start the ViolationCounter in a background thread.
-    Assumes rclpy.init() has already been called elsewhere.
-
-    Examples:
-      # programmatic
-      node = start_violation_monitor(zone_padding_m=0.5, corner_margin_m=0.3)
-
-      # via ROS params (if you expose as an executable):
-      # ros2 run hydra_teleop violations \
-      #   --ros-args -p zone_padding_m:=0.5 -p corner_margin_m:=0.3
+    Start the ViolationMonitor in a background thread.
+    Assumes rclpy.init() is called elsewhere (e.g., your main).
+    Returns the node and the thread.
     """
-    node = ViolationCounter(
+    node = ViolationMonitor(
         pose_topic=pose_topic,
         meta_path=meta_path,
-        zone_padding_m=zone_padding_m,
-        corner_margin_m=corner_margin_m,
+        deep_margin_m=deep_margin_m,
+        dwell_s=dwell_s,
+        min_step_m=min_step_m,
     )
     t = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     t.start()
-    return node
+    return node, t

@@ -24,13 +24,12 @@ from .navigation.teleop import GzTeleop
 from .simulation.pose_republisher import start_pose_bridge
 from .tools.bridge import start_parameter_bridge
 from .tools.violations import start_violation_monitor
-from .tools.nofly_generator import NoFlyGenerator, NoFlyGenCfg
-from .tools.target_generator import TargetGenerator, TargetGenCfg
-from .tools.event_emitter import EventEmitter
+from .tools.event_emitter import EventEmitter, EventCfg
 from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
 from .analysis.log_transformer import run_from_cfg
 from .analysis.statistics_analyzer import run_analysis
 from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
+from .tools.arena_generator import ArenaGenerator, ArenaGenCfg
 
 def _run_one_strategy(
     strategy_name: str,
@@ -93,6 +92,7 @@ def main() -> None:
     # --- Generators (single instances; re-run each loop) ---
     nofly_gen = None
     target_gen = None
+    arena_gen = None
 
     # --- Violation monitor (single instance; reset per run) ---
     violation_monitor = None
@@ -110,24 +110,32 @@ def main() -> None:
             ])
 
             # Start event emitter (separate executor thread)
-            emitter = EventEmitter(cfg)
+            emitter = EventEmitter(cfg, gen_cfg=EventCfg(seed=42, event_deterministic=True))
             emitter.start()
 
             # Velocity publisher
             ctrl = GzTeleop(cfg.topic, cfg)
-            ctrl.start()
-            
-            # Generators (No-fly + Target)
-            nofly_gen = NoFlyGenerator(cfg, NoFlyGenCfg())
-            target_gen = TargetGenerator(cfg, TargetGenCfg())
-            # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
-            nofly_gen.run()
-            target_gen.run()
             
             # Violation monitor
-            start_violation_monitor(zone_padding_m=-0.30, corner_margin_m=0.30)
+            #start_violation_monitor(zone_padding_m=-0.30, corner_margin_m=0.30)
+            viol_node, viol_thread = start_violation_monitor(
+                pose_topic="/model/drone1/pose/info",
+                meta_path="models/generated/generated_nofly_meta.json",
+                deep_margin_m= 2.0,
+                dwell_s=1
+            )
             for i in range(cfg.simulation_runs):
                 run_idx = i + 1
+                # Generators (No-fly + Target)
+                arena_gen = ArenaGenerator(cfg,ArenaGenCfg(
+                    seed=run_idx,
+                    #density=0.25, corr_len_m=12.0,
+                    target_min_dist=20.0,
+                    pass_through=True, visual_alpha=0.0,
+                    outdir="models/generated",
+                ))
+                # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
+                arena_gen.run()
                 print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
                 # ---------------- TROOP ----------------
                 for strategy in (cfg.analyzer_strategies):
@@ -142,10 +150,7 @@ def main() -> None:
                                 },
                                 extra = {
                                     "strategy" : strategy
-                                })  
-                # Regenerate NFZ and target every run
-                nofly_gen.run()
-                target_gen.run()
+                                })
         finally:
             # Teardown in reverse order of startup
             try:
@@ -181,7 +186,7 @@ def main() -> None:
         print(f"\n=== Simulations are 0, running in analysis mode only ===")
     
     run_from_cfg()
-    result = run_analysis()
+    result = run_analysis(zone_metric="mean")
     print(" Best strategy:", result["best_strategy"])
     print(" Metrics:", result["metrics"])
     print(" Summary CSV:", result["summary_csv"])

@@ -50,7 +50,7 @@ class DronePhysics:
     # ---------- ctor ----------
     def __init__(self, cfg) -> None:
         # Rate (used only for default dt + latency queue sizing)
-        self._default_dt = 1.0 / max(1.0, float(getattr(cfg, "rate_hz", 50.0)))
+        self._default_dt = 1.0 / max(1.0, cfg.rate_hz)
 
         # --- FlyCart 30 physical scale ---
         # DJI spec (with two DB2000 batteries): ~65 kg total mass (no payload).
