@@ -105,10 +105,11 @@ class EventEmitter(Node):
 
     def stop(self, destroy: bool = True):
         self._stop_flag.set()
+        # Wait for threads to actually finish; no timeout to avoid races
         if self._exp_thread:
-            self._exp_thread.join(timeout=1.0)
+            self._exp_thread.join()
         if self._spin_thread:
-            self._spin_thread.join(timeout=1.0)
+            self._spin_thread.join()
         self._exp_thread = None
         self._spin_thread = None
 
@@ -167,9 +168,9 @@ class EventEmitter(Node):
         last_wall_t = time.time()
         while not self._stop_flag.is_set():
             dt = self._draw_dt()
-
-            # Pace emissions in real time regardless of mode
-            time.sleep(dt)
+            # Interruptible sleep: exits immediately when stop() sets the flag
+            if self._stop_flag.wait(dt):
+                break
 
             if self._cfg.event_deterministic:
                 # Purely logical timing & deterministic delta
@@ -192,7 +193,18 @@ class EventEmitter(Node):
             deadline = self._deadline_from_dt(delta_t)
             obj = {"kind": kind, "t_emit": t_emit, "deadline_s": deadline, "meta": meta}
             msg = String(); msg.data = json.dumps(obj)
-            self._pub.publish(msg)
+            # Guard publish in case shutdown raced ahead
+            if self._stop_flag.is_set():
+                break
+            try:
+                self._pub.publish(msg)
+            except Exception as e:
+                # Likely shutdown in progress; exit cleanly
+                try:
+                    self.get_logger().warn(f"publish aborted during shutdown: {e}")
+                except Exception:
+                    pass
+                break
             if self._csv_fp:
                 self._csv.writerow([obj["t_emit"], kind, obj["deadline_s"], json.dumps(meta)])
 

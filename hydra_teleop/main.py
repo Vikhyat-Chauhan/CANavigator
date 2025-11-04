@@ -16,26 +16,34 @@ import os
 import csv
 import math
 import logging
+import threading  # <-- NEW
 from typing import List, Dict, Any, Optional, Tuple
+
+import rclpy
 
 from .config import TeleopConfig
 from .simulation.sim import start_sim, stop_sim
 from .navigation.teleop import GzTeleop
-from .simulation.pose_republisher import start_pose_bridge
+from .simulation.pose_republisher import add_pose_republisher_to_executor
 from .tools.bridge import start_parameter_bridge
-from .tools.violations import start_violation_monitor
+from .tools.violations import add_violation_monitor_to_executor, start_violation_monitor
+from .tools.energy_monitor import add_energy_monitor_to_executor, start_energy_monitor
 from .tools.event_emitter import EventEmitter, EventCfg
 from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
 from .analysis.log_transformer import run_from_cfg
 from .analysis.statistics_analyzer import run_analysis
 from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
 from .tools.arena_generator import ArenaGenerator, ArenaGenCfg
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+
 
 def _run_one_strategy(
     strategy_name: str,
     ctrl: GzTeleop,
-    cfg: TeleopConfig
-) -> Tuple[bool, Optional[float], int]:
+    cfg: TeleopConfig,
+    exec: MultiThreadedExecutor,
+) -> Tuple[bool, float]:  # <-- CHANGED: correct return type (2-tuple)
     """
     Start a fresh sim, run a navigator to target (with timeout), collect results.
     Ensures sim/nav clean shutdown even on exceptions.
@@ -45,6 +53,7 @@ def _run_one_strategy(
     try:
         sim = start_sim(cfg)
         nav = LidarTargetNavigatorTROOP(ctrl, cfg, strategy_name)
+        nav.attach_to_executor(exec)
         reached, elapsed = nav.go_to(timeout_s=cfg.simulation_timeout)
         return reached, elapsed
     finally:
@@ -67,7 +76,7 @@ def main() -> None:
     cfg = TeleopConfig()
     logcfg = AsyncLoggerCfg(
         logfile=cfg.log_path,
-        max_bytes=0, # disables rotation
+        max_bytes=0,  # disables rotation
         queue_maxsize=8000,
         drop_on_full=False,
         console=False,
@@ -80,7 +89,7 @@ def main() -> None:
     print(f"\n=== [LOGGING INITILIZED] ===")
 
     # --- Bridges (pose + ROS↔GZ) ---
-    pose_bridge = None
+    pose_node = None
     rosgz_bridge = None  # kept for symmetry if you add other bridges later
 
     # --- Event emitter ---
@@ -95,63 +104,97 @@ def main() -> None:
     arena_gen = None
 
     # --- Violation monitor (single instance; reset per run) ---
-    violation_monitor = None
+    viol_node= None
+    ener_node= None
 
     # Results
     stats: List[Dict[str, Any]] = []
-    if(cfg.simulation_runs != 0):
+
+    if cfg.simulation_runs != 0:
+        exec = None
+        spin_stop = threading.Event()  # <-- NEW
+        spin_thread = None             # <-- NEW
         try:
-            # Pose + ROS↔GZ bridges
-            pose_bridge = start_pose_bridge(["drone1", "target_sphere"])
+            rclpy.init()
+            exec = MultiThreadedExecutor(num_threads=3)  # <-- bump to 3 if events + nav + pose
+            cbg = ReentrantCallbackGroup()
+
+            # Pose republisher node (no spin here; we attach to shared executor)
+            pose_node = add_pose_republisher_to_executor(
+                exec, ["drone1", "target_sphere"], callback_group=cbg
+            )
+
+            # Start the ONE spin loop in a dedicated thread (non-blocking)
+            def _spin():
+                while rclpy.ok() and not spin_stop.is_set():
+                    exec.spin_once(timeout_sec=0.005)  # low latency
+
+            spin_thread = threading.Thread(target=_spin, daemon=True)
+            spin_thread.start()
+
             # Parameter bridge lines (cmd_vel, lidar) for world
             rosgz_bridge = start_parameter_bridge([
                 ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan"),
                 ("/model/drone1/cmd_vel", "geometry_msgs/msg/Twist", "gz.msgs.Twist"),
             ])
 
-            # Start event emitter (separate executor thread)
+            # Start event emitter (own internal thread; not an rclpy spin)
             emitter = EventEmitter(cfg, gen_cfg=EventCfg(seed=42, event_deterministic=True))
             emitter.start()
 
             # Velocity publisher
             ctrl = GzTeleop(cfg.topic, cfg)
-            
-            # Violation monitor
-            #start_violation_monitor(zone_padding_m=-0.30, corner_margin_m=0.30)
-            viol_node, viol_thread = start_violation_monitor(
+
+            # Violation & energy monitors (optional; keep disabled if they spin internally)
+            viol_node = add_violation_monitor_to_executor(
+                exec,
                 pose_topic="/model/drone1/pose/info",
                 meta_path="models/generated/generated_nofly_meta.json",
-                deep_margin_m= 2.0,
-                dwell_s=1
+                deep_margin_m=4.0,
+                dwell_s=1.0,
+                callback_group=cbg,  # optional, matches your other nodes
             )
+            ener_node = add_energy_monitor_to_executor(exec,  
+                pose_topic="/model/drone1/pose/info", 
+                callback_group=cbg)
+
             for i in range(cfg.simulation_runs):
                 run_idx = i + 1
+
                 # Generators (No-fly + Target)
-                arena_gen = ArenaGenerator(cfg,ArenaGenCfg(
-                    seed=run_idx,
-                    #density=0.25, corr_len_m=12.0,
+                arena_gen = ArenaGenerator(cfg, ArenaGenCfg(
+                    seed=run_idx+123,
                     target_min_dist=20.0,
                     pass_through=True, visual_alpha=0.0,
                     outdir="models/generated",
                 ))
-                # Fix Required : because violation monitor depends on the target and Zone generation we have to run it before
+                # Violation monitor depends on targets/NFZ → generate first
                 arena_gen.run()
+
                 print(f"\n=== Hydra Experiment Run {run_idx} (fresh target & NFZ) ===")
-                # ---------------- TROOP ----------------
+
+                # Strategies (APE1/APE2/APE3/TROOP) — each run uses same event seed
                 for strategy in (cfg.analyzer_strategies):
-                    # Event emitter will be resetted every run for now, to keep the sequence same for each isolated run. 
-                    # This will allow us to observe all APEs under same event load since the seed is fixed.
                     print(f"\n=== Hydra Experiment Strategy {strategy} ===")
                     emitter.reset()
-                    reached, elapsed = _run_one_strategy(strategy, ctrl, cfg)
-                    logger.info({
-                                    "reached" : reached,
-                                    "elapsed" : elapsed
-                                },
-                                extra = {
-                                    "strategy" : strategy
-                                })
+                    viol_node.mark_run_start(label=strategy)
+                    ener_node.mark_run_start(label=strategy)
+                    reached, elapsed = _run_one_strategy(strategy, ctrl, cfg, exec)
+                    violation_summary = viol_node.log_and_reset(label=strategy, include_boxes=True)
+                    energy_summary = ener_node.log_and_reset(label=strategy, include_params=True)
+                    logger.info(
+                        {"reached": reached, "elapsed": elapsed, "violations": violation_summary.get("total_violations"), "energy_j": energy_summary.get("energy_j"), "mean_power_w": energy_summary.get("mean_power_w")},
+                        extra={"strategy": strategy}
+                    )
         finally:
+            # Stop spin loop first (so no callbacks run during teardown)
+            try:
+                spin_stop.set()
+                if spin_thread is not None:
+                    spin_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
             # Teardown in reverse order of startup
             try:
                 if emitter is not None:
@@ -166,10 +209,24 @@ def main() -> None:
                 print(f"[hydra][WARN] ctrl.stop() error: {e}")
 
             try:
-                if pose_bridge is not None:
-                    pose_bridge.stop()
+                if pose_node is not None and exec is not None:
+                    exec.remove_node(pose_node)
+                    exec.remove_node(viol_node)
+                    exec.remove_node(ener_node)
+                    pose_node.close()
             except Exception as e:
-                print(f"[hydra][WARN] pose_bridge.stop() error: {e}")
+                print(f"[hydra][WARN] pose_node close/remove error: {e}")
+
+            try:
+                if exec is not None:
+                    exec.shutdown()
+            except Exception:
+                pass
+
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
             try:
                 if rosgz_bridge is not None:
@@ -181,10 +238,10 @@ def main() -> None:
                 if log_handle is not None:
                     log_handle.stop()
             except Exception as e:
-                print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
+                print(f"[hydra][WARN] log_handle.stop() error: {e}")
     else:
         print(f"\n=== Simulations are 0, running in analysis mode only ===")
-    
+
     run_from_cfg()
     result = run_analysis(zone_metric="mean")
     print(" Best strategy:", result["best_strategy"])
@@ -192,6 +249,7 @@ def main() -> None:
     print(" Summary CSV:", result["summary_csv"])
     print(" 2D plot:", result["plot_2d"])
     print(" 3D plot:", result["plot_3d"])
+
 
 if __name__ == "__main__":
     main()

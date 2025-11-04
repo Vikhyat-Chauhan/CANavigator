@@ -3,18 +3,12 @@
 Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
 
 - Detects run boundaries as: collect EVENTS up to hydra_teleop.teleop STOP,
-  then emits a row on the immediately following hydra_teleop.main {reached, elapsed}.
+  then emits a row on the immediately following hydra_teleop.main
+  {reached, elapsed, violations, energy_j, mean_power_w}.
 - Requires at least one EVENT in the run (otherwise no row).
 - CSV columns (order preserved):
-    timestamp, strategy, reached, elapse_time, zone_violations, event_violated, events_handled, event_violations
-
-Input/Output are taken **only** from TeleopConfig:
-    - cfg.log_path: path to the input JSON log (required)
-    - cfg.results_csv_path: path to write the output CSV (required)
-    - (optional) cfg.min_nav_start_dist_xy_m: float threshold; only emit rows for runs with
-      nav_start_dist_xy_m >= this value. If absent/None, no filtering is applied.
-
-No fallbacks, no guessing. If a required field is missing or the file does not exist, an exception is raised.
+    timestamp, strategy, reached, elapse_time, energy_kj, mean_power_kw,
+    nav_start_dist_xy_m, zone_violations, event_violated, events_handled, event_violations
 """
 
 from __future__ import annotations
@@ -33,10 +27,8 @@ def _is_main_terminator(rec: Dict[str, Any]) -> bool:
     if rec.get("name") != "hydra_teleop.main":
         return False
     msg = rec.get("msg")
+    # Terminator keyed by reached & elapsed; other fields validated at emit-time.
     return isinstance(msg, dict) and ("reached" in msg) and ("elapsed" in msg)
-
-def _is_zone_violation(rec: Dict[str, Any]) -> bool:
-    return rec.get("type") == "ZONEVIOLATION"
 
 def _is_event(rec: Dict[str, Any]) -> bool:
     return rec.get("type") == "EVENT" and rec.get("msg") == "EVENT" and isinstance(rec.get("payload"), dict)
@@ -80,7 +72,6 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
     current: Dict[str, Any] = {
         "events_handled": 0,
         "event_violations": 0,
-        "zone_violations": 0,
         "saw_any_event": False,
         "run_closed": False,            # becomes True at STOP; emit on next MAIN reached
         "nav_seen": False,              # must see POSES before emitting a row
@@ -92,7 +83,6 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
     def reset_counters():
         current["events_handled"] = 0
         current["event_violations"] = 0
-        current["zone_violations"] = 0
         current["saw_any_event"] = False
         current["run_closed"] = False
         current["nav_seen"] = False
@@ -112,7 +102,6 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
             # Required single POSES before nav per run (your guarantee)
             if _is_nav_start(rec):
                 payload = rec["payload"]
-                # direct parse; raise if missing since you guaranteed presence
                 try:
                     current["nav_start_dist_xy_m"] = float(payload["nav_start_dist_xy_m"])
                 except Exception:
@@ -124,9 +113,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                 current["nav_seen"] = True
                 continue
 
-            if _is_zone_violation(rec):
-                current["zone_violations"] += 1
-                continue
+            # Legacy per-event ZONEVIOLATION records are intentionally ignored.
 
             if _is_event(rec):
                 current["saw_any_event"] = True
@@ -150,11 +137,9 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                     # --- Distance filter applied here ---
                     if cfg.min_nav_start_dist_xy_m is not None:
                         nav_dist = current["nav_start_dist_xy_m"]
-                        # If nav_dist is missing, earlier code would have raised. Just be explicit:
                         if nav_dist is None:
                             raise RuntimeError("[log_transformer] Missing nav_start_dist_xy_m when applying distance filter.")
                         if nav_dist < float(cfg.min_nav_start_dist_xy_m):
-                            # Skip emission for this run but still reset counters for the next run.
                             reset_counters()
                             continue
                     # -----------------------------------
@@ -162,13 +147,32 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                     ts = rec.get("ts")
                     msg = rec.get("msg", {})
                     strategy = rec.get("strategy")
+
+                    # STRICT: pull final metrics from hydra_teleop.main
+                    try:
+                        zone_violations = int(msg["violations"])
+                    except Exception:
+                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing integer 'violations' at ts={ts}")
+
+                    # Energy & power (convert to kJ / kW)
+                    try:
+                        energy_kj = float(msg["energy_j"]) / 1000.0
+                    except Exception:
+                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing numeric 'energy_j' at ts={ts}")
+                    try:
+                        mean_power_kw = float(msg["mean_power_w"]) / 1000.0
+                    except Exception:
+                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing numeric 'mean_power_w' at ts={ts}")
+
                     row = {
                         "timestamp": ts,
                         "strategy": strategy,
                         "reached": bool(msg.get("reached")),
                         "elapse_time": float(msg.get("elapsed", 0.0)),
+                        "energy_kj": energy_kj,
+                        "mean_power_kw": mean_power_kw,
                         "nav_start_dist_xy_m": current["nav_start_dist_xy_m"],
-                        "zone_violations": int(current["zone_violations"]),
+                        "zone_violations": zone_violations,
                         "event_violated": current["event_violations"] > 0,
                         "events_handled": int(current["events_handled"]),
                         "event_violations": int(current["event_violations"]),
@@ -183,6 +187,8 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
         "strategy",
         "reached",
         "elapse_time",
+        "energy_kj",
+        "mean_power_kw",
         "nav_start_dist_xy_m",
         "zone_violations",
         "event_violated",

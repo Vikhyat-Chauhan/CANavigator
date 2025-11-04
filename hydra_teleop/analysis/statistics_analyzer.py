@@ -27,12 +27,17 @@ def run_analysis(
     CSV (case-insensitive accepted):
       strategy | reached | elapse_time | event_violated
       [optional] zone_violations
+      [optional] energy_kj         <-- NEW
+      [optional] mean_power_kw     <-- NEW
 
     NEW: A full round = {APE1, APE2, APE3, TROOP} is kept only if *all* those runs
          reached=True; otherwise the whole round is dropped.
 
     zone_metric: which aggregation to use for zone violations in ranking & plots.
                  One of {"median","mean"} (default: "median").
+
+    NOTE: Energy and mean power are *reported* in the strategy summary and plotted,
+          but are NOT used for winner selection (to preserve existing behavior).
     """
     zm = str(zone_metric).strip().lower()
     if zm not in {"median", "mean"}:
@@ -68,16 +73,23 @@ def run_analysis(
                 return c
         raise KeyError(f"Missing required column: '{col_name_expected}'. Found columns: {list(df_raw.columns)}")
 
+    # Required
     COL = {
         "strategy": resolve("strategy"),
         "reached": resolve("reached"),
         "elapsed": resolve("elapse_time"),
         "deadline_violation": resolve("event_violated"),
     }
-    try:
-        COL["zone_violations"] = resolve("zone_violations")
-    except KeyError:
-        COL["zone_violations"] = None
+    # Optional
+    def resolve_opt(name: str) -> str | None:
+        try:
+            return resolve(name)
+        except KeyError:
+            return None
+
+    COL["zone_violations"] = resolve_opt("zone_violations")
+    COL["energy_kj"] = resolve_opt("energy_kj")              # NEW
+    COL["mean_power_kw"] = resolve_opt("mean_power_kw")      # NEW
 
     # ---------- Coercions ----------
     def to_bool(s: pd.Series) -> pd.Series:
@@ -99,7 +111,9 @@ def run_analysis(
         "_reached": to_bool(df_raw[COL["reached"]]),
         "_elapsed_s": to_num(df_raw[COL["elapsed"]]),
         "_deadline_violation": to_bool(df_raw[COL["deadline_violation"]]),
-        "_zone_viol": to_num(df_raw[COL["zone_violations"]]) if COL["zone_violations"] else 0.0,
+        "_zone_viol": to_num(df_raw[COL["zone_violations"]]) if COL["zone_violations"] else np.nan,
+        "_energy_kj": to_num(df_raw[COL["energy_kj"]]) if COL["energy_kj"] else np.nan,         # NEW
+        "_mean_power_kw": to_num(df_raw[COL["mean_power_kw"]]) if COL["mean_power_kw"] else np.nan,  # NEW
     })
 
     # ---------- Round filter (retain ONLY full successful rounds APE1→APE2→APE3→TROOP) ----------
@@ -148,7 +162,7 @@ def run_analysis(
         s = s.dropna()
         return float(np.percentile(s, 95)) if len(s) else float("nan")
 
-    def any_zone(s: pd.Series) -> float:
+    def any_pos(s: pd.Series) -> float:
         s = s.dropna()
         if not len(s): return float("nan")
         return float((s > 0).mean())
@@ -159,9 +173,18 @@ def run_analysis(
         "reach_time_median_s": g["_elapsed_s"].apply(med),
         "reach_time_mean_s": g["_elapsed_s"].mean(),
         "reach_time_p95_s": g["_elapsed_s"].apply(p95),
+
+        # Zone violation aggregates (if absent -> NaN, downstream logic handles)
         "zone_violations_mean": g["_zone_viol"].mean(),
         "zone_violations_median": g["_zone_viol"].median(),
-        "p_any_zone_violation": g["_zone_viol"].apply(any_zone),
+        "p_any_zone_violation": g["_zone_viol"].apply(any_pos),
+
+        # NEW: Energy / Power aggregates
+        "energy_kj_mean": g["_energy_kj"].mean(),
+        "energy_kj_median": g["_energy_kj"].median(),
+        "energy_kj_p95": g["_energy_kj"].apply(p95),
+        "mean_power_kw_mean": g["_mean_power_kw"].mean(),
+        "mean_power_kw_median": g["_mean_power_kw"].median(),
     })
 
     # ---------- Tie-breaker metric over ALL runs (unfiltered): TIMEOUT RATE ----------
@@ -203,8 +226,7 @@ def run_analysis(
     S = summary.copy()
     S["admissible"] = S["deadline_violation_rate"] <= float(deadline_ok_tol)
 
-    # ---------- Winner selection (lexicographic)
-    # Sort by: deadline_violation_rate (asc) → median reach time (asc) → CHOSEN zone metric (asc) → timeout_rate_all (asc)
+    # ---------- Winner selection (lexicographic; unchanged)
     S["reach_time_median_s_rank"] = S["reach_time_median_s"]
     S["zone_chosen_rank"] = S[zone_col]
     S_sort = S.sort_values(
@@ -321,6 +343,55 @@ def run_analysis(
     plt.savefig(plot3d, dpi=160)
     plt.close()
 
+    # ---------- NEW: Energy/Power plots (if present) ----------
+    # Energy vs median reach time
+    plot_energy_vs_time = None
+    if S["energy_kj_median"].notna().any():
+        plt.figure(figsize=(7, 5))
+        plt.scatter(S["energy_kj_median"], S["reach_time_median_s"], edgecolors=edges, linewidths=1.0)
+        for name, xv, yv in zip(S.index, S["energy_kj_median"], S["reach_time_median_s"]):
+            if np.isfinite(yv):
+                plt.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5))
+        plt.xlabel("Median energy (kJ)")
+        plt.ylabel("Median reach time (s)")
+        plt.title("Energy vs Median Reach Time")
+        plt.tight_layout()
+        plot_energy_vs_time = os.path.join(out_dir, "energy_vs_time.png")
+        plt.savefig(plot_energy_vs_time, dpi=160)
+        plt.close()
+
+    # Energy vs deadline violation rate
+    plot_energy_vs_deadline = None
+    if S["energy_kj_median"].notna().any():
+        plt.figure(figsize=(7, 5))
+        plt.scatter(S["deadline_violation_rate"], S["energy_kj_median"], edgecolors=edges, linewidths=1.0)
+        for name, xv, yv in zip(S.index, S["deadline_violation_rate"], S["energy_kj_median"]):
+            if np.isfinite(yv):
+                plt.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5))
+        plt.xlabel("Deadline violation rate (per run)")
+        plt.ylabel("Median energy (kJ)")
+        plt.title("Energy vs Deadline Violation Rate")
+        plt.tight_layout()
+        plot_energy_vs_deadline = os.path.join(out_dir, "energy_vs_deadline.png")
+        plt.savefig(plot_energy_vs_deadline, dpi=160)
+        plt.close()
+
+    # Mean power vs median reach time
+    plot_power_vs_time = None
+    if S["mean_power_kw_median"].notna().any():
+        plt.figure(figsize=(7, 5))
+        plt.scatter(S["mean_power_kw_median"], S["reach_time_median_s"], edgecolors=edges, linewidths=1.0)
+        for name, xv, yv in zip(S.index, S["mean_power_kw_median"], S["reach_time_median_s"]):
+            if np.isfinite(yv):
+                plt.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5))
+        plt.xlabel("Median mean power (kW)")
+        plt.ylabel("Median reach time (s)")
+        plt.title("Mean Power vs Median Reach Time")
+        plt.tight_layout()
+        plot_power_vs_time = os.path.join(out_dir, "power_vs_time.png")
+        plt.savefig(plot_power_vs_time, dpi=160)
+        plt.close()
+
     # ---------- Return compact result ----------
     best_strategy_metrics = {
         "deadline_violation_rate": float(S.loc[best_strategy, "deadline_violation_rate"]),
@@ -334,6 +405,13 @@ def run_analysis(
         "timeout_rate_all": float(S.loc[best_strategy, "timeout_rate_all"]),
         "admissible": bool(S.loc[best_strategy, "admissible"]),
         "pareto_optimal": bool(S.loc[best_strategy, "pareto_optimal"]),
+
+        # NEW: energy/power snapshots for the best
+        "energy_kj_mean": float(S.loc[best_strategy, "energy_kj_mean"]) if "energy_kj_mean" in S.columns else float("nan"),
+        "energy_kj_median": float(S.loc[best_strategy, "energy_kj_median"]) if "energy_kj_median" in S.columns else float("nan"),
+        "energy_kj_p95": float(S.loc[best_strategy, "energy_kj_p95"]) if "energy_kj_p95" in S.columns else float("nan"),
+        "mean_power_kw_mean": float(S.loc[best_strategy, "mean_power_kw_mean"]) if "mean_power_kw_mean" in S.columns else float("nan"),
+        "mean_power_kw_median": float(S.loc[best_strategy, "mean_power_kw_median"]) if "mean_power_kw_median" in S.columns else float("nan"),
     }
 
     return {
@@ -345,4 +423,9 @@ def run_analysis(
         "plot_3d": plot3d,
         "plot_2d_zone_vs_deadline": plot2d_zone_vs_deadline,
         "plot_2d_reach_vs_zone": plot2d_reach_vs_zone,
+
+        # NEW plot paths (None if energy/power absent)
+        "plot_energy_vs_time": plot_energy_vs_time,
+        "plot_energy_vs_deadline": plot_energy_vs_deadline,
+        "plot_power_vs_time": plot_power_vs_time,
     }

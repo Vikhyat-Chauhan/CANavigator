@@ -12,7 +12,7 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
@@ -156,11 +156,12 @@ class EventDecisionCfg:
 
 # ---- internal subscribers ----
 class _PoseSub(Node):
-    def __init__(self, topic: str, node_name: str):
+    def __init__(self, topic: str, node_name: str, *, callback_group=None):
         super().__init__(node_name)
         self._lock = threading.Lock()
         self._latest: Optional[PoseStamped] = None
-        self.create_subscription(PoseStamped, topic, self._cb, 10)
+        cbg = callback_group or ReentrantCallbackGroup()
+        self.create_subscription(PoseStamped, topic, self._cb, 10, callback_group=cbg)
     def _cb(self, msg: PoseStamped):
         with self._lock:
             self._latest = msg
@@ -169,12 +170,13 @@ class _PoseSub(Node):
             return self._latest
 
 class _ScanSub(Node):
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, *, callback_group=None):
         super().__init__("hydra_nav_lidar")
         self._lock = threading.Lock()
         self._scan: Optional[LaserScan] = None
         self._t_last = 0.0
-        self.create_subscription(LaserScan, topic, self._cb, 10)
+        cbg = callback_group or ReentrantCallbackGroup()
+        self.create_subscription(LaserScan, topic, self._cb, 10, callback_group=cbg)
         self._printed = False
     def _cb(self, msg: LaserScan):
         with self._lock:
@@ -225,12 +227,13 @@ class _ScanSub(Node):
 
 class _EventSub(Node):
     """Subscribe to /hydra/event (std_msgs/String with JSON payload)."""
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, *, callback_group=None):
         super().__init__("hydra_event_sub")
         self._lock = threading.Lock()
         self._pending: Optional[Dict] = None
         self._t_last = 0.0
-        self.create_subscription(String, topic, self._cb, 10)
+        cbg = callback_group or ReentrantCallbackGroup()
+        self.create_subscription(String, topic, self._cb, 10, callback_group=cbg)
 
     def _cb(self, msg: String):
         try:
@@ -278,9 +281,11 @@ class LidarTargetNavigatorTROOP:
         entity = getattr(cfg, "entity_name", "drone1")
         drone_topic = drone_pose_topic or getattr(cfg, "ros_pose_topic", f"/model/{entity}/pose/info")
 
-        self._node_drone  = _PoseSub(drone_topic, "lidar_hydra_nav_drone_pose")
-        self._node_target = _PoseSub(target_pose_topic, "lidar_hydra_nav_target_pose")
-        self._node_scan   = _ScanSub(self._ac.scan_topic)
+        # Shared reentrant CB group for all subs
+        self._cbg = ReentrantCallbackGroup()
+        self._node_drone  = _PoseSub(drone_topic, "lidar_hydra_nav_drone_pose", callback_group=self._cbg)
+        self._node_target = _PoseSub(target_pose_topic, "lidar_hydra_nav_target_pose", callback_group=self._cbg)
+        self._node_scan   = _ScanSub(self._ac.scan_topic, callback_group=self._cbg)
 
         # Event subscriber + config
         self._edc = EventDecisionCfg()
@@ -304,13 +309,11 @@ class LidarTargetNavigatorTROOP:
                   safe_inflate_m=self._edc.safe_inflate_m,
                   selector_mode=self._edc.selector_mode)
 
-        self._node_evt   = _EventSub(getattr(cfg, "event_topic", self._edc.event_topic))
+        self._node_evt   = _EventSub(getattr(cfg, "event_topic", self._edc.event_topic), callback_group=self._cbg)
 
-        self._exec = SingleThreadedExecutor()
-        for n in (self._node_drone, self._node_target, self._node_scan, self._node_evt):
-            self._exec.add_node(n)
-        self._spin_thread = threading.Thread(target=self._spin, daemon=True)
-        self._spin_thread.start()
+        # NEW: external-executor pattern
+        self._executor = None
+        self._nodes = (self._node_drone, self._node_target, self._node_scan, self._node_evt)
 
         # APE1 avoidance state
         self._avoiding = False
@@ -362,20 +365,30 @@ class LidarTargetNavigatorTROOP:
             # Surface logging issues so they don't get swallowed
             print("LOGGING_ERROR:", e)
 
-    # ---------- threading ----------
-    def _spin(self):
-        try:
-            while rclpy.ok():
-                self._exec.spin_once(timeout_sec=0.01)
-        except Exception:
-            pass
+    # ---------- executor attach/detach ----------
+    def attach_to_executor(self, executor) -> None:
+        """Attach internal subscriber nodes to a shared executor (single owner)."""
+        if self._executor is not None:
+            return
+        for n in self._nodes:
+            executor.add_node(n)
+        self._executor = executor
 
     def shutdown(self):
+        """Detach and destroy nodes. Caller owns executor lifecycle."""
         try:
-            for n in (self._node_drone, self._node_target, self._node_scan, self._node_evt):
-                self._exec.remove_node(n)
-                n.destroy_node()
-            self._exec.shutdown()
+            if self._executor is not None:
+                for n in self._nodes:
+                    try:
+                        self._executor.remove_node(n)
+                    except Exception:
+                        pass
+                self._executor = None
+            for n in self._nodes:
+                try:
+                    n.destroy_node()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -646,6 +659,9 @@ class LidarTargetNavigatorTROOP:
     def go_to(self,
               target_xyz: Optional[Tuple[float, float, float]] = None,
               timeout_s: Optional[float] = None) -> Tuple[bool, float]:
+        # Safety: ensure we’re attached to an executor (otherwise subs never fire)
+        if self._executor is None:
+            raise RuntimeError("TROOP navigator is not attached to an executor. Call attach_to_executor(executor) first.")
         rate = max(1.0, float(self._gc.rate_hz))
         dt = 1.0 / rate
         t_start = time.time()
