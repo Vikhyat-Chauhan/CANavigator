@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 # hydra_teleop/violations.py
-# Deep-penetration NFZ violations (QUIET mode: logs only on demand):
+# Simple NFZ visit-based violations (QUIET mode):
 # - Loads axis-aligned rectangles (cx, cy, w, h) from generated_nofly_meta.json
-# - Counts a ZONEVIOLATION once per visit when depth >= deep_margin_m for at least dwell_s
-# - Does NOT log per-event during flight
+# - Counts exactly one ZONEVIOLATION per visit (i.e., on first ENTER after being outside)
+# - No depth/dwell thresholds; no per-event logs during flight
 # - Emits a single VIOLATIONSUMMARY only when log_and_reset() is called
 # - One-time LOADEDBOXES record at startup
-#
-# Tunables:
-#   deep_margin_m : required depth inside the rectangle (meters) to count as "too deep"
-#   dwell_s       : required continuous time spent deeper than deep_margin_m before violation
-#   min_step_m    : ignore pose updates with near-zero motion (noise debounce)
 
 import json, os, threading, math, time
 from typing import List, Tuple, Optional, Dict, Any
-import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 import logging
@@ -51,24 +45,10 @@ def point_in_rect(x: float, y: float, cx: float, cy: float, w: float, h: float) 
     return (cx - half_w) <= x <= (cx + half_w) and (cy - half_h) <= y <= (cy + half_h)
 
 
-def rect_depth_inside(x: float, y: float, cx: float, cy: float, w: float, h: float) -> float:
-    """
-    Signed "depth" (meters) relative to rectangle boundary (no padding).
-      > 0  : inside; value = min distance to the nearest side
-      = 0  : exactly on boundary
-      < 0  : outside; magnitude = how far to cross the boundary
-    """
-    half_w = max(0.0, w * 0.5)
-    half_h = max(0.0, h * 0.5)
-    dx = half_w - abs(x - cx)
-    dy = half_h - abs(y - cy)
-    return min(dx, dy)
-
-
 class ViolationMonitor(Node):
     """
     Subscribes to drone pose, tracks:
-      - a once-per-visit deep violation when depth_inside >= deep_margin_m for ≥ dwell_s
+      - exactly one violation per visit (first ENTER after being outside) per rectangle
 
     QUIET mode:
       - No per-event logs during flight.
@@ -79,8 +59,6 @@ class ViolationMonitor(Node):
         self,
         pose_topic: str = "/model/drone1/pose/info",
         meta_path: str = META_PATH,
-        deep_margin_m: float = 1.0,     # how deep into the rect to count as violation
-        dwell_s: float = 0.15,          # must remain deeper than deep_margin_m for this duration
         min_step_m: float = 1e-3,       # ignore tiny jitter steps
     ):
         super().__init__("violation_monitor")
@@ -89,22 +67,19 @@ class ViolationMonitor(Node):
         self._logger = logging.getLogger(__name__)
         self._lock = Lock()
 
-        # ROS params (constructor defaults are picked up if params not provided)
-        self.declare_parameter("deep_margin_m", deep_margin_m)
-        self.declare_parameter("dwell_s", dwell_s)
-        self.declare_parameter("min_step_m", min_step_m)
+        # Keep parameters for compatibility (values are ignored by logic)
+        self.declare_parameter("min_step_m", float(min_step_m))
 
-        self._deep = max(0.0, float(self.get_parameter("deep_margin_m").value))
-        self._dwell = max(0.0, float(self.get_parameter("dwell_s").value))
         self._min_step = max(0.0, float(self.get_parameter("min_step_m").value))
 
         self._rects = load_rects(meta_path)
         n = len(self._rects)
 
-        # Per-rect state for detection (visit logic)
-        self._armed = [True] * n                  # fire once per visit (re-armed on exit)
-        self._inside_prev = [False] * n           # previous inside status
-        self._deep_since: List[Optional[float]] = [None] * n  # time when we first got deep this visit
+        # Per-rect visit state
+        # armed[i] == True  → next ENTER will count a violation and disarm
+        # becomes re-armed only after EXIT (i.e., when we go from inside→outside)
+        self._armed: List[bool] = [True] * n
+        self._inside_prev: List[bool] = [False] * n
 
         # Per-rect counters (quiet accumulation)
         self._violations_per_rect: List[int] = [0] * n
@@ -123,9 +98,8 @@ class ViolationMonitor(Node):
         self._logger.info(
             {
                 "boxes": n,
-                "deep_margin": round(self._deep, 3),
-                "dwell_s": round(self._dwell, 3),
                 "mode": "quiet(log on demand)",
+                "rule": "one_violation_per_visit",
             },
             extra={"type": "LOADEDBOXES"},
         )
@@ -133,49 +107,32 @@ class ViolationMonitor(Node):
     # --------------------- Callbacks ----------------------
     def _on_pose(self, msg: PoseStamped):
         x, y = msg.pose.position.x, msg.pose.position.y
-        t_now = _now_from_msg_or_clock(self, msg)
+        _ = _now_from_msg_or_clock(self, msg)  # time available if you want it later
 
         with self._lock:
             # Motion debounce (optional; still updates state)
             if self._prev_xy is not None:
                 if math.hypot(x - self._prev_xy[0], y - self._prev_xy[1]) < self._min_step:
+                    # Too small movement; still update last pose below.
                     pass
 
-            # Per-rect checks (QUIET: no ENTER/EXIT or per-event logs)
+            # Visit logic: count exactly once on ENTER per rectangle
             for i, (cx, cy, w, h) in enumerate(self._rects):
                 now_in = point_in_rect(x, y, cx, cy, w, h)
 
-                # On exit, re-arm and clear deep timer (quiet)
-                if self._inside_prev[i] and not now_in:
-                    self._armed[i] = True
-                    self._deep_since[i] = None
-                    self._inside_prev[i] = False
-                    continue
-
+                was_in = self._inside_prev[i]
                 self._inside_prev[i] = now_in
 
-                # Only consider when inside
-                if not now_in:
-                    self._deep_since[i] = None
+                # EXIT → re-arm
+                if was_in and not now_in:
+                    self._armed[i] = True
                     continue
 
-                # Depth relative to rectangle boundary
-                depth = rect_depth_inside(x, y, cx, cy, w, h)
-
-                # Not deep enough: reset deep timer
-                if depth < self._deep:
-                    self._deep_since[i] = None
-                    continue
-
-                # Deep enough: start/continue dwell timer
-                if self._deep_since[i] is None:
-                    self._deep_since[i] = t_now
-
-                # If dwelled long enough and armed → record once per visit (QUIET: no log)
-                if self._armed[i] and (t_now - self._deep_since[i] >= self._dwell):
+                # ENTER while armed → count violation once, disarm until next EXIT
+                if not was_in and now_in and self._armed[i]:
                     self._violations_per_rect[i] += 1
                     self._total_violations += 1
-                    self._armed[i] = False  # disarm until EXIT
+                    self._armed[i] = False
 
             # Update last pose
             self._prev_xy = (x, y)
@@ -197,7 +154,6 @@ class ViolationMonitor(Node):
             n = len(self._rects)
             self._armed = [True] * n
             self._inside_prev = [False] * n
-            self._deep_since = [None] * n
 
     def _build_summary(self, label: str, include_boxes: bool) -> Dict[str, Any]:
         summary: Dict[str, Any] = {
@@ -205,8 +161,7 @@ class ViolationMonitor(Node):
             "wall_started_at": round(self._segment_start_wall, 3),
             "total_violations": int(self._total_violations),
             "last_pose": {"x": round(self._last_pose[0], 3), "y": round(self._last_pose[1], 3)},
-            "deep_margin_m": round(self._deep, 3),
-            "dwell_s": round(self._dwell, 3),
+            "rule": "one_violation_per_visit",
         }
         if include_boxes:
             per_box = []
@@ -242,7 +197,6 @@ class ViolationMonitor(Node):
             n = len(self._rects)
             self._armed = [True] * n
             self._inside_prev = [False] * n
-            self._deep_since = [None] * n
 
             return summary
 
@@ -250,8 +204,6 @@ class ViolationMonitor(Node):
 def start_violation_monitor(
     pose_topic: str = "/model/drone1/pose/info",
     meta_path: str = META_PATH,
-    deep_margin_m: float = 1.0,
-    dwell_s: float = 0.15,
     min_step_m: float = 1e-3,
     callback_group=None,
 ):
@@ -268,8 +220,6 @@ def start_violation_monitor(
     node = ViolationMonitor(
         pose_topic=pose_topic,
         meta_path=meta_path,
-        deep_margin_m=deep_margin_m,
-        dwell_s=dwell_s,
         min_step_m=min_step_m,
     )
     if callback_group is not None:
@@ -285,8 +235,6 @@ def add_violation_monitor_to_executor(
     executor,
     pose_topic: str = "/model/drone1/pose/info",
     meta_path: str = META_PATH,
-    deep_margin_m: float = 1.0,
-    dwell_s: float = 0.15,
     min_step_m: float = 1e-3,
     callback_group=None,
 ):
@@ -297,8 +245,6 @@ def add_violation_monitor_to_executor(
     node, _ = start_violation_monitor(
         pose_topic=pose_topic,
         meta_path=meta_path,
-        deep_margin_m=deep_margin_m,
-        dwell_s=dwell_s,
         min_step_m=min_step_m,
         callback_group=callback_group,
     )

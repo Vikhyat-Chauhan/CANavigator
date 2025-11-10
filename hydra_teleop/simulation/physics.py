@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # hydra_teleop/physics.py
 # FlyCart 30–tuned motion/actuator + environment shim for teleop velocity shaping.
-# References (see also bottom of file):
-# - DJI FlyCart 30 specs/manual for mass, tilt, speed, wind resistance:
-#   https://www.dji.com/flycart-30/specs
-#   https://dl.djicdn.com/downloads/DJI_FlyCart_30/202406UM/DJI_FlyCart_30_User_Manual_v1.1.pdf
-# - Quadrotor aerodynamic drag modeling & estimation:
-#   Hattenberger et al., "Evaluation of drag coefficient for a quadrotor model", 2023.
-#   https://journals.sagepub.com/doi/10.1177/17568293221148378
-# - Stochastic wind via Ornstein–Uhlenbeck (OU):
-#   Shimoni et al., AIAA 2024; Obukhov et al., Energies 2021 (fractional OU).
+#
+# === References (overview) ===
+# [DJI-FC30-SPECS] DJI FlyCart 30 — Product specs page (mass, speeds, wind resistance).
+# [DJI-FC30-UM]    DJI FlyCart 30 — User Manual v1.1 (2024/06) (envelopes, ops limits, ascent/descent rates).
+# [Hattenberger-2023] G. Hattenberger et al., "Evaluation of drag coefficient for a quadrotor model," 2023,
+#   Proc. IMechE Part G: Journal of Aerospace Engineering. (Quadratic |v|v drag dominance; identification.)
+# [OU-1930]  Uhlenbeck & Ornstein, Phys. Rev. 36, 823–841 (1930). (OU process.)
+# [Obukhov-2021] Obukhov et al., Energies 14 (2021). (Fractional OU for long-memory wind.)
+# [Dryden-Std] MIL-F-8785C / MIL-STD-1797 / NASA Dryden/von Kármán spectra (alt. to OU).
+# [Cuniato-2022] Cuniato et al., "Power-based Safety Layer for Aerial Vehicles...", arXiv:2211.08813 (jerk-limited shaping).
 
 from __future__ import annotations
 import math, random
@@ -23,12 +24,12 @@ class DronePhysics:
 
     Responsibilities:
       - Command latency (FIFO buffer)
-      - 2nd-order actuator dynamics (per-axis)
-      - Jerk limiting (accel slew-rate limit)
-      - Tilt/thrust caps (lateral accel, asym z accel)
-      - Aerodynamic drag (linear + quadratic; tune from logs)
-      - Wind gusts via Ornstein–Uhlenbeck on acceleration (scaled by wind level)
-      - Yaw dynamics (2nd-order + jerk + rate/accel caps)
+      - 2nd-order actuator dynamics (per-axis)   # [Cuniato-2022]
+      - Jerk limiting (accel slew-rate limit)    # [Cuniato-2022]
+      - Tilt/thrust caps (lateral accel, asym z) # [DJI-FC30-SPECS][DJI-FC30-UM]
+      - Aerodynamic drag (linear + quadratic)    # [Hattenberger-2023]
+      - Wind gusts via Ornstein–Uhlenbeck (OU)   # [OU-1930][Obukhov-2021]
+      - Yaw dynamics (2nd-order + jerk + caps)   # [Cuniato-2022]
 
     Public API:
       - update_cmd(vx, vy, vz, wz): push a new desired velocity
@@ -50,62 +51,64 @@ class DronePhysics:
     # ---------- ctor ----------
     def __init__(self, cfg) -> None:
         # Rate (used only for default dt + latency queue sizing)
-        self._default_dt = 1.0 / max(1.0, cfg.rate_hz)
+        rate_hz = float(getattr(cfg, "rate_hz", 50.0))
+        if not math.isfinite(rate_hz) or rate_hz <= 0.0:
+            rate_hz = 50.0
+        self._default_dt = 1.0 / max(1.0, rate_hz)
 
         # --- FlyCart 30 physical scale ---
         # DJI spec (with two DB2000 batteries): ~65 kg total mass (no payload).
         # Max tilt (pitch angle) 30°, wind resistance up to ~12 m/s, cruise ~15 m/s.
-        # Sources in comments above.
+        # Sources: [DJI-FC30-SPECS][DJI-FC30-UM]
         self._mass_kg       = float(getattr(cfg, "mass_kg", 65.0))
 
         # 2nd-order actuator dynamics (slightly conservative for a heavy lifter)
+        # Approximates closed-loop inner attitude/velocity dynamics. See [Cuniato-2022].
         self._zeta_lin      = float(getattr(cfg, "zeta_lin", 0.9))
         self._wn_lin        = float(getattr(cfg, "wn_lin_rad", 6.0))   # rad/s
         self._zeta_yaw      = float(getattr(cfg, "zeta_yaw", 0.9))
         self._wn_yaw        = float(getattr(cfg, "wn_yaw_rad", 5.0))
 
-        # Jerk limits (accel slew)
+        # Jerk limits (accel slew) — jerk-limited motion primitives are common in UAV safety layers [Cuniato-2022].
         self._jmax_lin      = float(getattr(cfg, "jerk_max_lin_mps3", 20.0))
         self._jmax_yaw      = float(getattr(cfg, "jerk_max_yaw_rps3", 40.0))
 
         # Aerodynamic drag (per-axis), with 1/m folded in.
-        # Start conservative; fit from logs later (see refs).
-        # a_drag ≈ -(k1 * v + k2 * |v| v)
+        # a_drag ≈ -(k1 * v + k2 * |v| v). Quadratic term dominates at typical speeds [Hattenberger-2023].
+        # Start conservative; later identify k1,k2 from flight/sim logs via regression as in [Hattenberger-2023].
         self._drag_k1       = float(getattr(cfg, "drag_lin_per_s", 0.20))
         self._drag_k2       = float(getattr(cfg, "drag_quad_per_m", 0.04))
 
-        # Gravity & lateral tilt/thrust geometry
+        # Gravity & lateral tilt/thrust geometry — lateral accel capped by tilt envelope [DJI-FC30-UM].
         self._g             = 9.80665
         self._max_tilt_deg  = float(getattr(cfg, "max_tilt_deg", 30.0))  # DJI spec
-        self._a_xy_max      = self._g * math.tan(math.radians(self._max_tilt_deg))
+        self._a_xy_max      = self._g * math.tan(math.radians(self._max_tilt_deg))  # ~5.66 m/s^2 for 30°
 
-        # Vertical accel/velocity caps (manual/specs imply rate limits more than accel)
-        # We implement *velocity* caps per DJI (5 m/s up, 3 m/s down) plus accel caps.
+        # Vertical accel/velocity caps reflecting DJI ascent/descent guidance [DJI-FC30-UM].
         self._a_z_up_max    = float(getattr(cfg, "a_z_up_max_mps2", 4.0))
         self._a_z_down_max  = float(getattr(cfg, "a_z_down_max_mps2", 5.0))
-        self._vz_up_max     = float(getattr(cfg, "vz_up_max_mps", 5.0))   # ascent cap
-        self._vz_down_max   = float(getattr(cfg, "vz_down_max_mps", 3.0)) # descent cap (positive magnitude)
+        self._vz_up_max     = float(getattr(cfg, "vz_up_max_mps", 5.0))   # ascent cap ~ spec
+        self._vz_down_max   = float(getattr(cfg, "vz_down_max_mps", 3.0)) # descent cap ~ spec (positive magnitude)
 
-        # Horizontal speed caps — DJI quotes 15 m/s typical limit, 20 m/s max.
-        # Default to 15 m/s unless you explicitly allow "sport" 20 m/s.
+        # Horizontal speed caps — 15 m/s typical; 20 m/s absolute per DJI specs [DJI-FC30-SPECS].
         self._v_horiz_max   = float(getattr(cfg, "v_horiz_max_mps", 15.0))
-        self._v_horiz_abs_max = float(getattr(cfg, "v_horiz_abs_max_mps", 20.0))  # safeguard ceiling
+        self._v_horiz_abs_max = float(getattr(cfg, "v_horiz_abs_max_mps", 20.0))  # safety ceiling
 
-        # Yaw rate/accel caps (conservative for a big coaxial lifter)
+        # Yaw rate/accel caps (conservative for a heavy coaxial lifter) — matches teleop feel; avoids unrealizable jerks [Cuniato-2022].
         self._wz_max        = float(getattr(cfg, "max_ang_speed_rps", 1.2))  # ~70 deg/s
         self._awz_max       = float(getattr(cfg, "yaw_acc_max_rps2", 6.0))
 
-        # Command latency (radio/stack + operator)
+        # Command latency (radio/stack + operator). Latency buffering is standard for teleop shaping.
         self._cmd_latency_s = float(getattr(cfg, "cmd_latency_s", 0.10))
         self._cmd_buf: Deque[Tuple[float, float, float, float]] = deque()
 
         # --- Wind (OU) ---
-        # Scale gust strength by a "wind level" (0..1) relative to ~12 m/s spec.
-        # This drives acceleration noise (not mean wind) to emulate buffeting.
-        self._wind_tau_s    = float(getattr(cfg, "wind_tau_s", 1.5))  # AIAA/OU-style correlation
+        # Use OU process for gust accelerations with exponential autocorrelation [OU-1930].
+        # Fractional OU is a drop-in upgrade if longer memory is needed [Obukhov-2021].
+        # Scale to DJI’s ~12 m/s wind resistance by tuning wind_level ∈ [0,1] [DJI-FC30-SPECS].
+        self._wind_tau_s    = float(getattr(cfg, "wind_tau_s", 1.5))  # correlation time (AIAA/OU-style)
         self._wind_level    = float(getattr(cfg, "wind_level_0to1", 0.5))
-        # Base accel std tuned so that wind_level=1.0 ~ near the 12 m/s resistance case.
-        self._wind_std_base = float(getattr(cfg, "wind_accel_std_base_mps2", 0.8))
+        self._wind_std_base = float(getattr(cfg, "wind_accel_std_base_mps2", 0.8))  # base accel noise scale
         self._wind_ax = self._wind_ay = self._wind_az = 0.0
 
         # Desired commands (latest)
@@ -119,10 +122,11 @@ class DronePhysics:
 
     # ---------- helpers ----------
     def _accel_2nd_order(self, v: float, a: float, v_cmd: float, wn: float, zeta: float) -> float:
-        # v'' = wn^2 * (v_cmd - v) - 2*zeta*wn * v'
+        # v'' = wn^2 * (v_cmd - v) - 2*zeta*wn * v'    # 2nd-order tracking; see [Cuniato-2022]
         return (wn * wn) * (v_cmd - v) - (2.0 * zeta * wn) * a
 
     def _apply_jerk_limit(self, a_cur: float, a_des: float, jmax: float, dt: float) -> float:
+        # Jerk limiter for smoothness/safety; aligns with jerk-limited primitives in UAV literature [Cuniato-2022].
         if dt <= 0.0 or jmax <= 0.0:
             return a_des
         a_step = jmax * dt
@@ -131,29 +135,29 @@ class DronePhysics:
         return a_des
 
     def _limit_accel_with_physics(self, ax: float, ay: float, az: float) -> Tuple[float, float, float]:
-        # Lateral tilt cap (a_xy <= g * tan(max_tilt))
+        # Lateral tilt cap (a_xy <= g * tan(max_tilt)) per [DJI-FC30-UM].
         mag_xy = self._vec_mag(ax, ay)
         if mag_xy > self._a_xy_max:
             s = self._a_xy_max / max(mag_xy, 1e-6)
             ax *= s; ay *= s
-        # Asymmetric vertical caps
+        # Asymmetric vertical caps reflecting ascent/descent limits [DJI-FC30-UM].
         if az > self._a_z_up_max:       az = self._a_z_up_max
         elif az < -self._a_z_down_max:  az = -self._a_z_down_max
         return ax, ay, az
 
     def _update_wind(self, a_prev: float, dt: float, std: float) -> float:
-        # Ornstein–Uhlenbeck: a_t = e^{-dt/τ} a_{t-1} + σ * sqrt(1 - e^{-2 dt/τ}) * N(0,1)
+        # Ornstein–Uhlenbeck: a_t = e^{-dt/τ} a_{t-1} + σ * sqrt(1 - e^{-2 dt/τ}) * N(0,1)   # [OU-1930]
         if std <= 0.0 or dt <= 0.0:
             return a_prev
         tau   = max(self._wind_tau_s, 1e-3)
         decay = math.exp(-dt / tau)
-        var   = std * math.sqrt(max(0.0, 1.0 - math.exp(-2.0 * dt / tau)))
-        return decay * a_prev + var * random.gauss(0.0, 1.0)
+        sigma = std * math.sqrt(max(0.0, 1.0 - math.exp(-2.0 * dt / tau)))
+        return decay * a_prev + sigma * random.gauss(0.0, 1.0)
 
     def _push_cmd(self, vx: float, vy: float, vz: float, wz: float, dt: float) -> None:
         self._cmd_buf.append((vx, vy, vz, wz))
         latency = max(self._cmd_latency_s, 0.0)
-        max_len = max(1, int(latency / max(dt, 1e-3)))
+        max_len = max(1, int(math.ceil(latency / max(dt, 1e-3))))
         while len(self._cmd_buf) > max_len:
             self._cmd_buf.popleft()
 
@@ -173,25 +177,27 @@ class DronePhysics:
         Returns the filtered/publishable (vx, vy, vz, wz).
         """
         dt = float(dt if dt is not None else self._default_dt)
+        if not math.isfinite(dt) or dt <= 0.0:
+            dt = self._default_dt
         dt = max(1e-4, dt)
 
         # Maintain latency buffer using the *latest* desired command
         self._push_cmd(self._vx_cmd, self._vy_cmd, self._vz_cmd, self._wz_cmd, dt)
         vx_cmd, vy_cmd, vz_cmd, wz_cmd = self._peek_delayed_cmd()
 
-        # --- Wind update (OU on accel), scaled by wind_level (0..1) ---
+        # --- Wind update (OU on accel), scaled by wind_level (0..1) ---  # [OU-1930][Obukhov-2021]
         wind_sigma = max(0.0, min(1.0, self._wind_level)) * self._wind_std_base
         self._wind_ax = self._update_wind(self._wind_ax, dt, wind_sigma)
         self._wind_ay = self._update_wind(self._wind_ay, dt, wind_sigma)
-        # Vertical gusts a bit weaker:
+        # Vertical gusts slightly weaker:
         self._wind_az = self._update_wind(self._wind_az, dt, wind_sigma * 0.6)
 
-        # --- Linear desired accelerations via 2nd-order model ---
+        # --- Linear desired accelerations via 2nd-order model ---  # [Cuniato-2022]
         ax_des = self._accel_2nd_order(self._vx, self._ax, vx_cmd, self._wn_lin, self._zeta_lin)
         ay_des = self._accel_2nd_order(self._vy, self._ay, vy_cmd, self._wn_lin, self._zeta_lin)
         az_des = self._accel_2nd_order(self._vz, self._az, vz_cmd, self._wn_lin, self._zeta_lin)
 
-        # Aerodynamic drag (opposes velocity); 1/m folded into k1/k2
+        # Aerodynamic drag (opposes velocity); 1/m folded into k1/k2 — see [Hattenberger-2023].
         ax_des += -(self._drag_k1 * self._vx + self._drag_k2 * abs(self._vx) * self._vx)
         ay_des += -(self._drag_k1 * self._vy + self._drag_k2 * abs(self._vy) * self._vy)
         az_des += -(self._drag_k1 * self._vz + self._drag_k2 * abs(self._vz) * self._vz)
@@ -199,12 +205,12 @@ class DronePhysics:
         # Add OU wind accelerations
         ax_des += self._wind_ax; ay_des += self._wind_ay; az_des += self._wind_az
 
-        # Jerk (slew) limits
+        # Jerk (slew) limits  # [Cuniato-2022]
         ax_des = self._apply_jerk_limit(self._ax, ax_des, self._jmax_lin, dt)
         ay_des = self._apply_jerk_limit(self._ay, ay_des, self._jmax_lin, dt)
         az_des = self._apply_jerk_limit(self._az, az_des, self._jmax_lin, dt)
 
-        # Physical caps (tilt / thrust)
+        # Physical caps (tilt / thrust) — lateral from tilt; vertical from ascent/descent limits [DJI-FC30-UM].
         ax_des, ay_des, az_des = self._limit_accel_with_physics(ax_des, ay_des, az_des)
 
         # Integrate accel->vel
@@ -212,20 +218,20 @@ class DronePhysics:
         self._vx += self._ax * dt; self._vy += self._ay * dt; self._vz += self._az * dt
 
         # --- Velocity clamps ---
-        # Horizontal: clamp both to "policy" cap and to an absolute ceiling.
+        # Horizontal: clamp to policy cap (15 m/s default) and absolute ceiling (20 m/s) per [DJI-FC30-SPECS].
         vxy = self._vec_mag(self._vx, self._vy)
         vxy_cap = min(self._v_horiz_max, self._v_horiz_abs_max)
-        if vxy > vxy_cap:
+        if vxy > vxy_cap and vxy > 1e-9:
             s = vxy_cap / vxy
             self._vx *= s; self._vy *= s
 
-        # Vertical: DJI ascent/descent rate limits
+        # Vertical: DJI ascent/descent rate limits [DJI-FC30-UM].
         if self._vz > self._vz_up_max:
             self._vz = self._vz_up_max
         elif self._vz < -self._vz_down_max:
             self._vz = -self._vz_down_max
 
-        # ---- yaw dynamics ----
+        # ---- yaw dynamics ----  # [Cuniato-2022]
         # wz'' = wn^2 (wz_cmd - wz) - 2*zeta*wn * wz'
         awz_des = (self._wn_yaw * self._wn_yaw) * (wz_cmd - self._wz) - (2.0 * self._zeta_yaw * self._wn_yaw) * self._awz
         awz_des = self._apply_jerk_limit(self._awz, awz_des, self._jmax_yaw, dt)
@@ -248,21 +254,20 @@ class DronePhysics:
 
 # ----------------------------- Notes & Tuning -----------------------------
 # DJI FlyCart 30 key limits used here:
-# - Weight: ~65 kg with two DB2000 batteries; MTOW up to ~95 kg (with cargo).
-# - Max pitch/tilt: ~30°  -> lateral accel cap a_xy_max = g * tan(30°) ≈ 5.66 m/s².
-# - Max horizontal speed: 15 m/s typical; 20 m/s max (not enabled by default).
-# - Max ascent speed 5 m/s; max descent speed 3 m/s.
-# - Max wind resistance ~12 m/s; "wind_level"=1.0 is roughly that scenario.
+# - Weight: ~65 kg with two DB2000 batteries; MTOW up to ~95 kg (with cargo).      # [DJI-FC30-SPECS][DJI-FC30-UM]
+# - Max pitch/tilt: ~30°  -> lateral accel cap a_xy_max = g * tan(30°) ≈ 5.66 m/s². # [DJI-FC30-UM]
+# - Max horizontal speed: 15 m/s typical; 20 m/s max.                               # [DJI-FC30-SPECS]
+# - Max ascent speed 5 m/s; max descent speed 3 m/s.                                # [DJI-FC30-UM]
+# - Max wind resistance ~12 m/s; "wind_level"=1.0 approximates that scenario.       # [DJI-FC30-SPECS]
 #
-# Validate these against your sim world timestep and logging; if your loop dt is
-# coarser than ~20 ms, consider raising damping (zeta) slightly to avoid overshoot.
+# Drag fitting hint (from [Hattenberger-2023]):
+#   Regress residual acceleration a_residual = dv/dt - a_model ≈ -(k1 v + k2 |v| v) per axis.
+#   Use flight/sim data to solve for (k1,k2), capture quadratic dominance at typical speeds.
 #
-# Drag:
-#   Start with k1 ~ 0.15–0.3 1/s, k2 ~ 0.03–0.06 1/m. Fit from logs by regressing:
-#     a_residual = dv/dt - model_accel ≈ -(k1 v + k2 |v| v)
-#   Hattenberger et al. 2023 provides methodology for estimating aerodynamic drag.
+# Wind modeling notes:
+#   OU parameters (tau, sigma) approximate gust autocorrelation and strength [OU-1930].
+#   For canonical turbulence spectra, Dryden/von Kármán standards can replace OU [Dryden-Std].
 #
-# Wind:
-#   OU parameters (tau, sigma) approximate gust autocorrelation and strength.
-#   Increase wind_level toward 1.0 to emulate stronger buffeting (near 12 m/s).
-#   See AIAA 2024 / Energies 2021 for OU-based stochastic wind modeling.
+# Teleop shaping rationale:
+#   2nd-order tracking with jerk limits provides smooth, realizable demands and aligns with
+#   layered safety/control architectures in recent UAV work [Cuniato-2022].

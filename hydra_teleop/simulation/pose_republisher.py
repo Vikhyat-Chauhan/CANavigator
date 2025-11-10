@@ -17,8 +17,6 @@ I tried several methods to get drone positions when the simulation is running :
 import json, subprocess, threading
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Union, List
-
-import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped

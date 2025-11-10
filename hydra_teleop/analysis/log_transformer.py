@@ -7,7 +7,7 @@ Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
   {reached, elapsed, violations, energy_j, mean_power_w}.
 - Requires at least one EVENT in the run (otherwise no row).
 - CSV columns (order preserved):
-    timestamp, strategy, reached, elapse_time, energy_kj, mean_power_kw,
+    timestamp, strategy, run, reached, elapse_time, energy_kj, mean_power_kw,
     nav_start_dist_xy_m, zone_violations, event_violated, events_handled, event_violations
 """
 
@@ -102,7 +102,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
             # Required single POSES before nav per run (your guarantee)
             if _is_nav_start(rec):
                 payload = rec["payload"]
-                try:
+                try: 
                     current["nav_start_dist_xy_m"] = float(payload["nav_start_dist_xy_m"])
                 except Exception:
                     raise ValueError(f"[log_transformer] POSES missing 'nav_start_dist_xy_m' at ts={rec.get('ts')}")
@@ -167,6 +167,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                     row = {
                         "timestamp": ts,
                         "strategy": strategy,
+                        # 'run' is assigned in a post-pass once we know grouping across strategies
                         "reached": bool(msg.get("reached")),
                         "elapse_time": float(msg.get("elapsed", 0.0)),
                         "energy_kj": energy_kj,
@@ -181,10 +182,29 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                 reset_counters()
                 continue
 
+    # ---------- Assign per-cycle run tags ----------
+    def assign_run_tags(rows: List[Dict[str, Any]]) -> None:
+        CYCLE_STRATS = {"APE1", "APE2", "APE3", "TROOP"}
+        seen: set = set()
+        run_idx = 1
+        for r in rows:
+            # Default to current run index
+            r["run"] = run_idx
+            s = str(r.get("strategy")) if r.get("strategy") is not None else ""
+            if s in CYCLE_STRATS:
+                seen.add(s)
+                if seen == CYCLE_STRATS:
+                    # Completed one full cycle; next row starts a new run
+                    seen.clear()
+                    run_idx += 1
+
+    assign_run_tags(rows)
+
     # Write CSV (order preserved)
     cols = [
         "timestamp",
         "strategy",
+        "run",  # <-- new column for grouping
         "reached",
         "elapse_time",
         "energy_kj",
@@ -195,6 +215,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
         "events_handled",
         "event_violations",
     ]
+    out_path = Path(cfg.output_csv_path)  # ensure still in scope
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -205,25 +226,11 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
 
 # ---------- Public entrypoint: STRICT TeleopConfig ----------
 def run_from_cfg() -> List[Dict[str, Any]]:
-    cfg = TeleopConfig()
-
-    if not hasattr(cfg, "log_path") or not isinstance(cfg.log_path, str) or not cfg.log_path:
-        raise AttributeError("TeleopConfig must define a non-empty string 'log_path' (input JSON log path).")
-    if not hasattr(cfg, "results_csv_path") or not isinstance(cfg.results_csv_path, str) or not cfg.results_csv_path:
-        raise AttributeError("TeleopConfig must define a non-empty string 'results_csv_path' (output CSV path).")
-
-    # Optional threshold; accept None if absent
-    min_xy = None
-    if hasattr(cfg, "min_nav_start_dist_xy_m") and cfg.min_nav_start_dist_xy_m is not None:
-        try:
-            min_xy = float(cfg.min_nav_start_dist_xy_m)
-        except Exception:
-            raise TypeError("TeleopConfig.min_nav_start_dist_xy_m must be a float if provided.")
 
     return transform(TransformCfg(
-        input_log_path=cfg.log_path,
-        output_csv_path=cfg.results_csv_path,
-        min_nav_start_dist_xy_m=min_xy,
+        input_log_path="logs/run_logs.json",
+        output_csv_path="logs/results/experiment_summary.csv",
+        min_nav_start_dist_xy_m=0,
     ))
 
 if __name__ == "__main__":

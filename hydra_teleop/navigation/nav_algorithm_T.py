@@ -9,14 +9,11 @@ import math, threading, time, json
 from dataclasses import dataclass
 from typing import Optional, Tuple, Set, List, Deque, Dict
 from collections import deque
-
-import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-
 from hydra_teleop.navigation.teleop import GzTeleop
 from hydra_teleop.config import TeleopConfig
 import logging
@@ -153,6 +150,12 @@ class EventDecisionCfg:
     # NEW: selector mode → "TROOP" (default), or force "APE1" | "APE2" | "APE3"
     selector_mode: str = "TROOP"
 
+    # === NEW (SUDDEN OBSTACLE, size not from emitter/LiDAR) ===
+    # Treat the obstacle as a front-centered cylinder/disc; radius must exceed vehicle radius.
+    sudden_obj_radius_m: float = 1.2      # >= drone radius; configurable constant
+    sudden_obj_clearance_m: float = 0.3   # extra side clearance to guarantee pass
+    sidestep_deg: float = 110.0           # target yaw offset for lateral sidestep
+    sidestep_speed_frac: float = 0.35     # fraction of max_v while sidestepping
 
 # ---- internal subscribers ----
 class _PoseSub(Node):
@@ -307,7 +310,11 @@ class LidarTargetNavigatorTROOP:
                   ape_budgets_ms=[self._edc.ape1_budget_ms, self._edc.ape2_budget_ms, self._edc.ape3_budget_ms],
                   v_cap_frac=self._edc.v_cap_frac,
                   safe_inflate_m=self._edc.safe_inflate_m,
-                  selector_mode=self._edc.selector_mode)
+                  selector_mode=self._edc.selector_mode,
+                  sudden_obj_radius_m=self._edc.sudden_obj_radius_m,
+                  sudden_obj_clearance_m=self._edc.sudden_obj_clearance_m,
+                  sidestep_deg=self._edc.sidestep_deg,
+                  sidestep_speed_frac=self._edc.sidestep_speed_frac)
 
         self._node_evt   = _EventSub(getattr(cfg, "event_topic", self._edc.event_topic), callback_group=self._cbg)
 
@@ -479,6 +486,34 @@ class LidarTargetNavigatorTROOP:
         if not math.isfinite(width): width = float('inf')
         if not math.isfinite(skew):  skew = 0.0
         return width, skew
+    
+    def _confidence_from_scan(self, scan: Optional[LaserScan], yaw_err: float) -> float:
+        """
+        0..1 confidence from forward LiDAR & alignment:
+          - more forward clearance (dmin) → higher confidence
+          - wider corridor near forward → higher confidence
+          - smaller |yaw_err| → higher confidence
+          - consistent arc safety left/center/right → higher confidence
+        """
+        if scan is None:
+            return 0.0
+        # forward window clearance
+        fwd_vals = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
+        dmin = min(fwd_vals) if fwd_vals else float('inf')
+        dmin_n = max(0.0, min(1.0, (dmin - 4.0) / 16.0))  # 4–20 m → 0–1
+        # corridor width near forward
+        w, _ = self._gap_metrics(scan)
+        w_n = 0.0 if not math.isfinite(w) else max(0.0, min(1.0, (w - 3.0) / 12.0))  # 3–15 m
+        # alignment
+        yaw_n = 1.0 - max(0.0, min(1.0, abs(yaw_err) / math.radians(40.0)))  # <=40° good
+        # arc safety consistency
+        cL = self._arc_is_clear(scan, -15.0, 4.0)
+        cC = self._arc_is_clear(scan,   0.0, 4.0)
+        cR = self._arc_is_clear(scan, +15.0, 4.0)
+        cons_n = ( (1.0 if cL else 0.0) + (1.0 if cC else 0.0) + (1.0 if cR else 0.0) ) / 3.0
+        # weighted blend
+        conf = 0.35*dmin_n + 0.30*w_n + 0.25*yaw_n + 0.10*cons_n
+        return max(0.0, min(1.0, conf))
 
     # ---------- No-fly helpers ----------
     def _nofly_rects(self):
@@ -558,80 +593,167 @@ class LidarTargetNavigatorTROOP:
     def _evt_put(self, name, v, wz, vz, score):
         with self._evt_lock:
             self._evt_proposals[name] = {"v": v, "wz": wz, "vz": vz, "score": score, "ready_t": time.time()}
+    
+        # ---------- shared motion standardization for APEs ----------
+    def _shared_motion_caps(self, base_v: float, yaw_goal_rad: float, base_vz: float, scan: Optional[LaserScan],
+                            v_cap_frac_override: Optional[float] = None,
+                            curvature_k_scale: float = 1.0):
+        """
+        Apply identical motion rules for all APEs:
+          wz = clamp(kp_yaw * yaw_goal, ±max_wz)
+          v  = min(base_v, edc.v_cap_frac*max_v, curvature_cap, stopping_cap)
+        Returns (v, wz, vz, dmin)
+        """
+        # yaw command (proportional, clamped)
+        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * _wrap_pi(yaw_goal_rad)))
+
+        # look-ahead distance in a narrow forward window (for stopping cap)
+        dmin = float('inf')
+        if scan is not None:
+            window = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
+            dmin = min(window) if window else float('inf')
+
+        # curvature cap (optionally scaled for smarter planners)
+        curv_k = max(0.05, float(self._rc.curvature_k) * float(curvature_k_scale))
+        curv_cap = self._gc.max_v / (1.0 + curv_k * abs(wz))
+
+        # v_cap for events (allow APE-specific override)
+        v_event_cap = (v_cap_frac_override if v_cap_frac_override is not None else self._edc.v_cap_frac) * self._gc.max_v
+
+        # combine
+        v = min(base_v, v_event_cap, curv_cap)
+        v = self._stopping_limited_speed(v, dmin)
+
+        return v, wz, base_vz, dmin
+
+    # === APE1 / APE2 / APE3 UPDATED TO HANDLE SUDDEN FRONT OBSTACLE (SIZE FROM CONFIG) ===
+    # NOTE: The event is expected to have kind "SUDDEN_OBSTACLE" to trigger this path.
+    #       The radius is taken ONLY from EventDecisionCfg (constant), not from emitter/LiDAR.
 
     def _evt_plan_ape1(self, snap, budget_ms):
         """
-        APE1 (IMPULSIVE): minimal computation, quick reflex.
-        Behavior: snap yaw to safer side immediately, clamp speed hard, coarse TTC.
-        Complexity: O(1) (a few sector reads). No sleeping.
+        APE1 (IMPULSIVE): Same motion caps as others; differs only in how fast it
+        proposes a heading (very cheap logic).
         """
-        left, right = snap["left"], snap["right"]
-        v_cmd, wz_cmd, vz_cmd = snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"]
-        scan = snap["scan"]
+        v_cmd, vz_cmd, scan = snap["v_cmd"], snap["vz_cmd"], snap["scan"]
 
-        # pick side (tie -> bias), then SNAP yaw at max rate
-        pick_left = (left > right) if abs(left - right) >= self._sc.ambiguity_eps_m else (self._side_bias > 0)
-        wz_cmd = (+self._gc.max_wz) if pick_left else (-self._gc.max_wz)
+        if snap.get("sudden_obj", False):
+            # choose side: bias on tie, do not use scan for *size*
+            pick_left = (self._side_bias > 0) if abs(snap["left"] - snap["right"]) < self._sc.ambiguity_eps_m else (snap["left"] > snap["right"])
+            target_off = math.radians(self._edc.sidestep_deg) * (+1 if pick_left else -1)
+            # identical base speed rule for all APEs during sidestep
+            base_v = min(v_cmd, self._edc.sidestep_speed_frac * self._gc.max_v)
+            v, wz, vz, _ = self._shared_motion_caps(base_v, target_off, 0.0, scan)
+            # decisive but crude → low score to be chosen only when time is tight
+            return self._evt_put("APE1", v, wz, vz, score=-1e6)
 
-        # very conservative forward speed (impulsive brake-first behavior)
-        v_cmd = min(v_cmd, 0.30 * self._gc.max_v)
-
-        # coarse TTC clamp using a tiny forward window (impulsive = short horizon)
-        dmin = float('inf')
-        if scan is not None:
-            w = _ScanSub._window_vals(scan, 0.0, max(4.0, self._ac.front_deg))
-            dmin = min(w) if w else float('inf')
-        v_cmd = self._stopping_limited_speed(v_cmd, dmin)
-
-        # slight nudge away from very near side wall (reactive “flinch”)
-        if min(left, right) < (2.0 * self._rc.vehicle_radius_m + 0.4):
-            wz_cmd += 0.25 if left < right else -0.25
-
-        # APE1 is intentionally crude -> worst reach times, but safest “instant evade”
-        self._evt_put("APE1", v_cmd, wz_cmd, vz_cmd, score=-1e3)
+        # === legacy fallback (not sudden): ultra-fast heuristic heading ===
+        # pick left/right coarse turn around forward; no unique speed multipliers
+        best_deg = +self._ac.side_center_deg if snap["left"] >= snap["right"] else -self._ac.side_center_deg
+        yaw_goal = math.radians(best_deg)
+        base_v = v_cmd
+        v, wz, vz, dmin = self._shared_motion_caps(base_v, yaw_goal, vz_cmd, scan)
+        # prefer safer headings (more dmin) lightly; keep score cheap/fast
+        score = - (0.1 * abs(best_deg))
+        self._evt_put("APE1", v, wz, vz, score)
 
     def _evt_plan_ape2(self, snap, budget_ms):
-        # Local opening: sweep wider; prefer wide & aligned gaps
+        """
+        APE2 (LOCAL): Same motion caps; spends a bit more time to pick a better heading.
+        """
+        v_cmd, vz_cmd, scan = snap["v_cmd"], snap["vz_cmd"], snap["scan"]
+
+        if snap.get("sudden_obj", False):
+            pick_left = (self._side_bias > 0)
+            target_off = math.radians(self._edc.sidestep_deg) * (+1 if pick_left else -1)
+            base_v = min(v_cmd, self._edc.sidestep_speed_frac * self._gc.max_v)
+            v, wz, vz, _ = self._shared_motion_caps(base_v, target_off, 0.0, scan)
+            # slightly reward smoother |wz|
+            score = -0.2 * abs(wz)
+            return self._evt_put("APE2", v, wz, vz, score)
+
+        # === legacy fallback (not sudden): budgeted local search around forward ===
         t0 = time.time()
-        scan = snap["scan"]
-        if scan is None:
-            return self._evt_put("APE2", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
         best_deg, best_score = 0.0, -1e18
         for deg in range(-70, 71, 2):
-            r = self._range_at(scan, deg, 2.0)
+            r = self._range_at(scan, deg, 2.0) if scan is not None else 0.0
             if not math.isfinite(r): r = 0.0
-            # add mild alignment term to avoid big late turns
-            align = -0.15 * abs(deg)
-            score = r + align
-            if score > best_score:
-                best_score, best_deg = score, deg
+            # simple quality: larger clearance + slight alignment with forward
+            quality = r - 0.15 * abs(deg)
+            if quality > best_score:
+                best_score, best_deg = quality, deg
             if (time.time() - t0)*1000.0 > budget_ms:
                 break
-        hdr = math.radians(best_deg)
-        yaw_goal = _wrap_pi(hdr)
-        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * yaw_goal))
-        v = min(snap["v_cmd"], 0.62 * self._gc.max_v)
-        score = - (max(0.0, 6.0 - float(best_score)) + 0.3*abs(wz))  # prefer wide-ish + not too twisty
-        self._evt_put("APE2", v, wz, snap["vz_cmd"], score)
+        yaw_goal = math.radians(best_deg)
+        base_v = v_cmd
+        v, wz, vz, dmin = self._shared_motion_caps(base_v, yaw_goal, vz_cmd, scan)
+        score = +0.05 * (dmin if math.isfinite(dmin) else 0.0) - 0.1 * abs(wz)
+        self._evt_put("APE2", v, wz, vz, score)
 
     def _evt_plan_ape3(self, snap, budget_ms):
-        # Trajectory-aware: doorway/corridor centering + TTC + curvature
-        scan = snap["scan"]
-        if scan is None:
-            return self._evt_put("APE3", snap["v_cmd"], snap["wz_cmd"], snap["vz_cmd"], score=1e3)
+        """
+        APE3 (TRAJ-AWARE, ANYTIME): deeper search yields a confidence score.
+        Higher confidence → higher allowed v_cap and gentler curvature penalty.
+        Posts an early plan, then refines within budget.
+        """
+        v_cmd, vz_cmd, scan = snap["v_cmd"], snap["vz_cmd"], snap["scan"]
+
+        if snap.get("sudden_obj", False):
+            # Confidence from scan/yaw; larger → more speed while sidestepping
+            conf = self._confidence_from_scan(scan, snap["yaw_err"])
+            ds = (self._edc.sudden_obj_radius_m + self._rc.vehicle_radius_m + self._edc.sudden_obj_clearance_m)
+            pick_left = (self._side_bias > 0)
+            target_off = math.radians(self._edc.sidestep_deg) * (+1 if pick_left else -1)
+            sidestep_speed_frac_eff = min(0.95, self._edc.sidestep_speed_frac + 0.2*conf)
+            base_v = min(v_cmd, sidestep_speed_frac_eff * self._gc.max_v)
+            vcap = min(0.95, self._edc.v_cap_frac + 0.2*conf)
+            curv_scale = (1.0 - 0.4*conf)
+            v, wz, vz, _ = self._shared_motion_caps(base_v, target_off, 0.0, scan,
+                                                    v_cap_frac_override=vcap,
+                                                    curvature_k_scale=curv_scale)
+            score = +0.12 * ds - 0.04 * abs(wz) + 0.02 * v  # prefer wider clearance, smoother & faster
+            return self._evt_put("APE3", v, wz, vz, score)
+
+        # === non-sudden: corridor-aware sweep with anytime behavior ===
         yaw_err = snap["yaw_err"]; x = snap["x"]; y = snap["y"]
-        hdr = self._choose_heading(scan, yaw_err, x, y)
-        wz = max(-self._gc.max_wz, min(self._gc.max_wz, self._gc.kp_yaw * _wrap_pi(hdr)))
-        v = min(snap["v_cmd"], self._gc.max_v / (1.0 + self._rc.curvature_k * abs(wz)))
-        # forward window for TTC
-        dmin = float('inf')
-        window = _ScanSub._window_vals(scan, 0.0, max(5.0, self._ac.front_deg))
-        dmin = min(window) if window else float('inf')
-        v = self._stopping_limited_speed(v, dmin)
-        s_clear = (dmin if math.isfinite(dmin) else 0.0)
-        # More weight to clearance; tiny penalty on high yaw-rate
-        score = - (1.2*s_clear - 0.3*abs(wz))
-        self._evt_put("APE3", v, wz, snap["vz_cmd"], score)
+        t0 = time.time()
+        best_deg, best_score = 0.0, -1e18
+        posted = False
+        conf = self._confidence_from_scan(scan, yaw_err)
+        vcap = min(0.95, self._edc.v_cap_frac + 0.2*conf)       # up to +20% headroom
+        curv_scale = (1.0 - 0.4*conf)                            # up to 40% less curvature penalty
+
+        for deg in range(-70, 71, 1):
+            if (time.time() - t0)*1000.0 > budget_ms:
+                break
+            if not self._arc_is_clear(scan, deg, self._rc.arc_check_m):
+                continue
+            r = self._range_at(scan, deg, 2.0) if scan is not None else 0.0
+            if not math.isfinite(r): r = 0.0
+            # corridor & alignment terms
+            l = self._range_at(scan, deg + self._rc.gate_half_deg, 2.0) if scan is not None else 0.0
+            rr = self._range_at(scan, deg - self._rc.gate_half_deg, 2.0) if scan is not None else 0.0
+            skew = abs(l - rr) if (math.isfinite(l) and math.isfinite(rr)) else 0.0
+            align = -0.08 * abs(deg - math.degrees(yaw_err))
+            quality = (r - 0.5*skew) + align
+            if quality > best_score:
+                best_score, best_deg = quality, deg
+            # Post an initial “good enough” plan early (anytime)
+            if not posted and (time.time() - t0) * 1000.0 > 25.0:
+                yaw_goal = math.radians(best_deg)
+                v, wz, vz, dmin = self._shared_motion_caps(v_cmd, yaw_goal, vz_cmd, scan,
+                                                           v_cap_frac_override=vcap,
+                                                           curvature_k_scale=curv_scale)
+                self._evt_put("APE3", v, wz, vz, score=0.08*(dmin if math.isfinite(dmin) else 0.0) - 0.04*abs(wz) + 0.02*v)
+                posted = True
+
+        # Final/best plan within budget
+        yaw_goal = math.radians(best_deg)
+        v, wz, vz, dmin = self._shared_motion_caps(v_cmd, yaw_goal, vz_cmd, scan,
+                                                   v_cap_frac_override=vcap,
+                                                   curvature_k_scale=curv_scale)
+        score = 0.1*(dmin if math.isfinite(dmin) else 0.0) - 0.04*abs(wz) + 0.02*v
+        self._evt_put("APE3", v, wz, vz, score)
 
     # ---------- event helpers ----------
     def _evt_violate(self, reason: str = "miss"):
@@ -726,7 +848,6 @@ class LidarTargetNavigatorTROOP:
             if evt is not None:
                 # If an event is already active, try to RESOLVE CURRENT first:
                 if self._evt_active:
-                    # Choose best ready plan for the CURRENT event; else count violation
                     tl_curr = max(0.0, self._evt_deadline_at - time.time())
 
                     # Which planner we prefer for the *current* event given its remaining time
@@ -777,6 +898,10 @@ class LidarTargetNavigatorTROOP:
                     if t.is_alive(): t.join(timeout=0.001)
                 self._evt_threads = []
 
+                # Determine if this event is the special SUDDEN OBSTACLE type.
+                evt_kind = str(evt.get("kind", "")).strip().upper()
+                sudden_flag = True#(evt_kind == "SUDDEN_OBSTACLE")
+
                 # Snapshot deterministic state
                 snap = {
                     "x": x, "y": y, "z": z, "yaw": yaw,
@@ -785,6 +910,8 @@ class LidarTargetNavigatorTROOP:
                     "scan": scan,
                     "front": front, "left": left, "right": right,
                     "yaw_err": _wrap_pi(math.atan2(ey, ex) - yaw),
+                    # NEW: flag to tell APEs to perform constant-radius sidestep logic
+                    "sudden_obj": sudden_flag,
                 }
 
                 # Fire one-shot planners in parallel (respect selector_mode)

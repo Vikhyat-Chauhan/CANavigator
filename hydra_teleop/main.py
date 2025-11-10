@@ -28,12 +28,11 @@ from .simulation.pose_republisher import add_pose_republisher_to_executor
 from .tools.bridge import start_parameter_bridge
 from .tools.violations import add_violation_monitor_to_executor, start_violation_monitor
 from .tools.energy_monitor import add_energy_monitor_to_executor, start_energy_monitor
-from .tools.event_emitter import EventEmitter, EventCfg
+from .tools.event_emitter import add_event_emitter_to_executor, EventCfg
 from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
 from .analysis.log_transformer import run_from_cfg
 from .analysis.statistics_analyzer import run_analysis
 from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
-from .tools.arena_generator import ArenaGenerator, ArenaGenCfg
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 
@@ -99,8 +98,6 @@ def main() -> None:
     ctrl = None
 
     # --- Generators (single instances; re-run each loop) ---
-    nofly_gen = None
-    target_gen = None
     arena_gen = None
 
     # --- Violation monitor (single instance; reset per run) ---
@@ -139,7 +136,10 @@ def main() -> None:
             ])
 
             # Start event emitter (own internal thread; not an rclpy spin)
-            emitter = EventEmitter(cfg, gen_cfg=EventCfg(seed=42, event_deterministic=True))
+            emitter = add_event_emitter_to_executor(exec, 
+                cfg, 
+                gen_cfg=EventCfg(seed=42, event_deterministic=True),
+                callback_group=cbg)
             emitter.start()
 
             # Velocity publisher
@@ -150,8 +150,8 @@ def main() -> None:
                 exec,
                 pose_topic="/model/drone1/pose/info",
                 meta_path="models/generated/generated_nofly_meta.json",
-                deep_margin_m=4.0,
-                dwell_s=1.0,
+                #deep_margin_m=4.0,
+                #dwell_s=1.0,
                 callback_group=cbg,  # optional, matches your other nodes
             )
             ener_node = add_energy_monitor_to_executor(exec,  
@@ -162,12 +162,19 @@ def main() -> None:
                 run_idx = i + 1
 
                 # Generators (No-fly + Target)
+                if(cfg.simulation_world_style == "city"):
+                    from .tools.arena_generator_city import ArenaGenerator, ArenaGenCfg
+                else:
+                    from .tools.arena_generator_perlin import ArenaGenerator, ArenaGenCfg
                 arena_gen = ArenaGenerator(cfg, ArenaGenCfg(
-                    seed=run_idx+123,
+                    seed=run_idx+cfg.world_gen_seed_offset,
                     target_min_dist=20.0,
                     pass_through=True, visual_alpha=0.0,
                     outdir="models/generated",
                 ))
+                logger.info(
+                        {"simulationruns": cfg.simulation_runs,"seedoffset": cfg.world_gen_seed_offset,"arena": cfg.simulation_world_style,}
+                )
                 # Violation monitor depends on targets/NFZ → generate first
                 arena_gen.run()
 
@@ -244,11 +251,9 @@ def main() -> None:
 
     run_from_cfg()
     result = run_analysis(zone_metric="mean")
-    print(" Best strategy:", result["best_strategy"])
-    print(" Metrics:", result["metrics"])
-    print(" Summary CSV:", result["summary_csv"])
-    print(" 2D plot:", result["plot_2d"])
-    print(" 3D plot:", result["plot_3d"])
+    print(" Zone Metric:", result["zone_metric"])
+    print(" Summary Csv:", result["summary_csv"])
+    print(" Summary:", result["summary"])
 
 
 if __name__ == "__main__":

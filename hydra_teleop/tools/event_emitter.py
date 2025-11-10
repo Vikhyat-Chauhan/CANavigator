@@ -5,10 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import json, time, threading, random, math, csv, os
-
-import rclpy
 from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 # Pose is only used in non-deterministic mode
 from geometry_msgs.msg import PoseStamped
@@ -74,11 +71,7 @@ class EventEmitter(Node):
             pose_topic = getattr(teleop_cfg, "ros_pose_topic", "/model/drone1/pose/info")
             self.create_subscription(PoseStamped, pose_topic, self._on_pose, 10)
 
-        self._exec = SingleThreadedExecutor()
-        self._exec.add_node(self)
-
         self._stop_flag = threading.Event()
-        self._spin_thread: Optional[threading.Thread] = None
         self._exp_thread: Optional[threading.Thread] = None
 
         # Deterministic logical clock + index
@@ -95,23 +88,17 @@ class EventEmitter(Node):
 
     # ---------------- Lifecycle ----------------
     def start(self):
-        if self._spin_thread is None:
-            self._stop_flag.clear()
-            self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
-            self._spin_thread.start()
+        # no executor spin here; the app adds this node to its shared executor
         if self._exp_thread is None:
+            self._stop_flag.clear()
             self._exp_thread = threading.Thread(target=self._loop, daemon=True)
             self._exp_thread.start()
 
     def stop(self, destroy: bool = True):
         self._stop_flag.set()
-        # Wait for threads to actually finish; no timeout to avoid races
         if self._exp_thread:
             self._exp_thread.join()
-        if self._spin_thread:
-            self._spin_thread.join()
         self._exp_thread = None
-        self._spin_thread = None
 
         if destroy:
             if self._csv_fp:
@@ -121,16 +108,12 @@ class EventEmitter(Node):
                     self._csv_fp.close()
                 self._csv_fp = None
             try:
-                self._exec.remove_node(self)
+                self.destroy_node()
             except Exception:
                 pass
-            self.destroy_node()
 
     def reset(self):
-        """
-        Fully deterministic reset: rewinds RNG and logical clock, clears index.
-        Keeps the ROS node/publisher and CSV file open.
-        """
+        """Deterministic reset: rewind RNG/clock/index; keep node & CSV open."""
         self.stop(destroy=False)
         self._rnd = random.Random(self._cfg.seed)
         self._t_logical = 0.0
@@ -139,10 +122,6 @@ class EventEmitter(Node):
         self.start()
 
     # ---------------- Internals ----------------
-    def _spin_loop(self):
-        while rclpy.ok() and not self._stop_flag.is_set():
-            self._exec.spin_once(timeout_sec=0.01)
-
     def _on_pose(self, msg: PoseStamped):
         with self._pose_lock:
             self._pose_latest = msg
@@ -219,3 +198,32 @@ class EventEmitter(Node):
         w = self._rnd.uniform(6.0, 12.0)
         h = self._rnd.uniform(4.0, 10.0)
         return {"rect_wh": [round(w, 3), round(h, 3)]}
+
+def make_event_emitter_node(teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None,
+                            callback_group=None) -> EventEmitter:
+    """
+    Construct the EventEmitter node (no spinning). Caller must:
+      1) add this node to their shared executor, and
+      2) call emitter.start() to begin emission thread.
+    """
+    node = EventEmitter(teleop_cfg, gen_cfg)
+    if callback_group is not None:
+        # assign the callback group to the subscription if present
+        try:
+            for sub in node.subscriptions:
+                sub.callback_group = callback_group
+        except Exception:
+            pass
+    return node
+
+
+def add_event_emitter_to_executor(executor, teleop_cfg: TeleopConfig,
+                                  gen_cfg: Optional[EventCfg] = None,
+                                  callback_group=None) -> EventEmitter:
+    """
+    Convenience: make the emitter node and add it to the provided executor.
+    Returns the node (call .start() to begin emitting).
+    """
+    node = make_event_emitter_node(teleop_cfg, gen_cfg, callback_group=callback_group)
+    executor.add_node(node)
+    return node

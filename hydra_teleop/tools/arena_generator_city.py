@@ -12,6 +12,30 @@
 #                      city_major_m=60.0, city_minor_m=30.0,
 #                      road_w_m=6.0, lot_w_m=14.0, lot_h_m=12.0,
 #                      lot_setback_m=1.5, lot_fill_prob=0.9, lot_jitter_m=2.0)
+# -----------------------------------------------------------------------------
+# References (IEEE style) for city-style NFZ generation & target placement
+#
+# [1] P. Parish and P. Müller, “Procedural Modeling of Cities,” Proc. SIGGRAPH, 2001.
+# [2] G. Chen, G. Esch, P. Wonka, and P. Müller, “Interactive Procedural Street Modeling,”
+#     ACM Trans. Graph. (SIGGRAPH Asia), vol. 27, no. 5, 2008.
+# [3] D. Galin, A. Peytavie, N. Maréchal, and E. Guérin, “Procedural Generation of Roads,”
+#     Computer Graphics Forum (Eurographics), vol. 29, no. 2, pp. 429–438, 2010.
+# [4] D. Galin, E. Guérin, A. Peytavie, and N. Maréchal, “Authoring Hierarchical Road Networks,”
+#     Computer Graphics Forum (Eurographics), vol. 30, no. 7, pp. 2021–2030, 2011.
+# [5] D. Aliaga, C. Vanegas, and B. Benes, “Interactive Example-Based Urban Layout Synthesis,”
+#     ACM Trans. Graph., vol. 27, no. 5, 2008 / surveys & follow-ups 2009–2012 (parcels/blocks).
+# [6] P. Müller, P. Wonka, S. Haegler, A. Ulmer, and L. Van Gool, “Procedural Modeling of
+#     Buildings,” Proc. SIGGRAPH, 2006.
+# [7] P. Wonka, M. Wimmer, F. Sillion, and W. Ribarsky, “Instant Architecture,” ACM Trans.
+#     Graph. (SIGGRAPH), vol. 22, no. 3, pp. 669–677, 2003.
+#
+# Code mapping:
+#   - Major/minor grids & road widths: [1], [2]   (deterministic grid w/ minor irregularities)
+#   - Blocks → lot subdivision + setbacks: [5]    (parceling inside blocks)
+#   - Per-lot building rectangles (NFZ proxies): [6], [7]
+#   - Hierarchical/weighted road rationale (optional extension): [3], [4]
+# -----------------------------------------------------------------------------
+
 
 from dataclasses import dataclass
 from typing import Tuple, List, Optional, Dict
@@ -83,7 +107,7 @@ class ArenaGenCfg:
     lot_w_m        = 13.0
     lot_h_m        = 11.0
     lot_setback_m  = 0.8
-    lot_fill_prob  = 0.88
+    lot_fill_prob  = 0.9
     lot_jitter_m   = 2.0
 
     # Visual/physics
@@ -133,6 +157,7 @@ class _NoFlyCity:
         for (xa, xb) in x_blocks:
             for (ya, yb) in y_blocks:
                 # sidewalks/setbacks inside each block
+                # Subdivide domain into blocks between adjacent road lines; apply sidewalk/setback [5]
                 xa_i = xa + road_half + self.setback
                 xb_i = xb - road_half - self.setback
                 ya_i = ya + road_half + self.setback
@@ -141,10 +166,13 @@ class _NoFlyCity:
                     continue  # too small block
 
                 # 3) Subdivide block into lots; randomly fill lots with buildings (NFZs)
+                # Regular parcel/lot slicing of blocks; simple tiling variant in spirit of parceling literature [5]
                 x_lots = self._tiles(xa_i, xb_i, self.lot_w)
                 y_lots = self._tiles(ya_i, yb_i, self.lot_h)
                 for (lx0, lx1) in x_lots:
                     for (ly0, ly1) in y_lots:
+                        # Random lot occupancy and mild massing jitter to avoid perfect grid look [1], [2];
+                        # each occupied lot emits a rectangular NFZ proxy for a building footprint [6], [7]
                         if rng.random() > self.fill_p:
                             continue  # leave as courtyard/park/parking (free)
                         # Jitter size a bit and clamp into lot
@@ -162,6 +190,8 @@ class _NoFlyCity:
 
     # ----- helpers -----
     def _axis_lines(self, vmin, vmax, major, minor):
+        # Major/minor orthogonal grids motivated by procedural city layout: [1], [2]
+        # Deterministic placement for reproducibility; jitter applied at lot scale (not here).
         # Centered grids for symmetry; include domain edges.
         lines = set([vmin, vmax, 0.0])
         def add(step):
@@ -400,3 +430,65 @@ def run(teleop_cfg=None, **kwargs) -> Dict[str, str]:
                  lot_fill_prob=0.9, lot_jitter_m=2.0)
     """
     return ArenaGenerator(teleop_cfg, ArenaGenCfg(**kwargs)).run()
+
+'''
+@inproceedings{Parish2001Cities,
+  author = {Parish, Y. I. H. and M{\"u}ller, P.},
+  title = {Procedural Modeling of Cities},
+  booktitle = {Proc. SIGGRAPH},
+  year = {2001}
+}
+
+@article{Chen2008Streets,
+  author = {Chen, G. and Esch, G. and Wonka, P. and M{\"u}ller, P.},
+  title = {Interactive Procedural Street Modeling},
+  journal = {ACM Trans. Graph.},
+  volume = {27},
+  number = {5},
+  year = {2008}
+}
+
+@article{Galin2010Roads,
+  author = {Galin, D. and Peytavie, A. and Mar{\'e}chal, N. and Gu{\'e}rin, E.},
+  title = {Procedural Generation of Roads},
+  journal = {Computer Graphics Forum},
+  volume = {29},
+  number = {2},
+  pages = {429--438},
+  year = {2010}
+}
+
+@article{Galin2011HierarchicalRoads,
+  author = {Galin, D. and Gu{\'e}rin, E. and Peytavie, A. and Mar{\'e}chal, N.},
+  title = {Authoring Hierarchical Road Networks},
+  journal = {Computer Graphics Forum},
+  volume = {30},
+  number = {7},
+  pages = {2021--2030},
+  year = {2011}
+}
+
+@inproceedings{Mueller2006Buildings,
+  author = {M{\"u}ller, P. and Wonka, P. and Haegler, S. and Ulmer, A. and Van Gool, L.},
+  title = {Procedural Modeling of Buildings},
+  booktitle = {Proc. SIGGRAPH},
+  year = {2006}
+}
+
+@article{Wonka2003InstantArchitecture,
+  author = {Wonka, P. and Wimmer, M. and Sillion, F. and Ribarsky, W.},
+  title = {Instant Architecture},
+  journal = {ACM Trans. Graph.},
+  volume = {22},
+  number = {3},
+  pages = {669--677},
+  year = {2003}
+}
+
+@article{Aliaga2012Parcels,
+  author = {Aliaga, D. and Vanegas, C. and Benes, B.},
+  title = {Procedural Generation of Parcels in Urban Modeling},
+  journal = {Computer Graphics Forum},
+  year = {2012}
+}
+'''
