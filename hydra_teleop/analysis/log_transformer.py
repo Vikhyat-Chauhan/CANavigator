@@ -4,11 +4,12 @@ Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
 
 - Detects run boundaries as: collect EVENTS up to hydra_teleop.teleop STOP,
   then emits a row on the immediately following hydra_teleop.main
-  {reached, elapsed, violations, energy_j, mean_power_w}.
+  {reached, elapsed, violations, energy_j, mean_power_w, compute_energy_j}.
 - Requires at least one EVENT in the run (otherwise no row).
 - CSV columns (order preserved):
     timestamp, strategy, run, reached, elapse_time, energy_kj, mean_power_kw,
-    nav_start_dist_xy_m, zone_violations, event_violated, events_handled, event_violations
+    compute_energy_j, nav_start_dist_xy_m, zone_violations,
+    event_violated, events_handled, event_violations
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import json
 import csv
-from hydra_teleop.config import TeleopConfig
+from hydra_teleop.config import TeleopConfig  # kept for STRICT-ness, not used directly below
 
 # ---------- Shape helpers ----------
 def _is_stop(rec: Dict[str, Any]) -> bool:
@@ -102,7 +103,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
             # Required single POSES before nav per run (your guarantee)
             if _is_nav_start(rec):
                 payload = rec["payload"]
-                try: 
+                try:
                     current["nav_start_dist_xy_m"] = float(payload["nav_start_dist_xy_m"])
                 except Exception:
                     raise ValueError(f"[log_transformer] POSES missing 'nav_start_dist_xy_m' at ts={rec.get('ts')}")
@@ -164,6 +165,15 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                     except Exception:
                         raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing numeric 'mean_power_w' at ts={ts}")
 
+                    # NEW: compute_energy_j (leave in joules, tiny magnitude compared to flight energy)
+                    compute_energy_j = 0.0
+                    try:
+                        if "compute_energy_j" in msg and msg["compute_energy_j"] is not None:
+                            compute_energy_j = float(msg["compute_energy_j"])
+                    except Exception:
+                        # If present but malformed, surface a clear error
+                        raise ValueError(f"[log_transformer] terminator 'compute_energy_j' not numeric at ts={ts}")
+
                     row = {
                         "timestamp": ts,
                         "strategy": strategy,
@@ -172,6 +182,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                         "elapse_time": float(msg.get("elapsed", 0.0)),
                         "energy_kj": energy_kj,
                         "mean_power_kw": mean_power_kw,
+                        "compute_energy_j": compute_energy_j,  # <-- added
                         "nav_start_dist_xy_m": current["nav_start_dist_xy_m"],
                         "zone_violations": zone_violations,
                         "event_violated": current["event_violations"] > 0,
@@ -204,18 +215,18 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
     cols = [
         "timestamp",
         "strategy",
-        "run",  # <-- new column for grouping
+        "run",  # grouping across strategies
         "reached",
         "elapse_time",
         "energy_kj",
         "mean_power_kw",
+        "compute_energy_j",          # <-- added to CSV
         "nav_start_dist_xy_m",
         "zone_violations",
         "event_violated",
         "events_handled",
         "event_violations",
     ]
-    out_path = Path(cfg.output_csv_path)  # ensure still in scope
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -226,7 +237,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
 
 # ---------- Public entrypoint: STRICT TeleopConfig ----------
 def run_from_cfg() -> List[Dict[str, Any]]:
-
+    # Point to the uploaded log by default
     return transform(TransformCfg(
         input_log_path="logs/run_logs.json",
         output_csv_path="logs/results/experiment_summary.csv",
