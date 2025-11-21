@@ -874,6 +874,11 @@ class LidarTargetNavigatorTROOP:
             # ---- Event intake ----
             evt = self._node_evt.pop()
             if evt is not None:
+                self._log("EVENT", type="ARRIVAL",
+                          t_rec=evt["t_recv"],
+                          deadline_s=evt.get("deadline_s", 0.0),
+                          deadlind_computed=evt["t_recv"] + max(0.0, float(evt.get("deadline_s", 0.0))))
+                #print("EVENT ARRIVED ", evt["t_recv"], evt.get("deadline_s", 0.0), evt["t_recv"] + max(0.0, float(evt.get("deadline_s", 0.0))))
                 # count this event as handled for this run
                 self._events_handled += 1
 
@@ -904,6 +909,8 @@ class LidarTargetNavigatorTROOP:
                     else:
                         # no usable plan for the old event before new one arrived
                         self._evt_violate("PREEMPTIVE")
+                        self._log("EVENT", type="PREMPTIVE", c_time=time.time())
+                        #print("PREMPTIVE")
                         self._evt_clear()
 
                 # Start tracking the new event
@@ -1013,6 +1020,8 @@ class LidarTargetNavigatorTROOP:
                 if tl <= 0.0:
                     # deadline miss counts as violation
                     self._evt_violate("DEADLINE")
+                    self._log("EVENT", type="DEADLINE", c_time=time.time())
+                    #print("DEADLINE")
                     self._evt_clear()
                 else:
                     # choose target planner based on time-left
@@ -1050,7 +1059,13 @@ class LidarTargetNavigatorTROOP:
                         _, prop = chosen
                         v_cmd, wz_cmd, vz_cmd = prop["v"], prop["wz"], prop["vz"]
                         if not self._evt_resolved:
+                            self._log("EVENT", type="RESOLVED",
+                                planner=_,
+                                ready_t=prop["ready_t"])
+                            #print("RESOLVED BY ", _, " at ", prop["ready_t"])
                             self._evt_resolved = True
+                            #self._evt_clear()   # always clear after first use
+                            #self._evt_deadline_at = 0
 
             # ---------- Avoidance / heading select ----------
             if stale:

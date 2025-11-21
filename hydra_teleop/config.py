@@ -6,7 +6,7 @@ from typing import Optional, Tuple, List
 @dataclass
 class TeleopConfig:
     # --- Run Options ---
-    simulation_runs = 500
+    simulation_runs = 1
     simulation_timeout = 200
     simulation_world_style = "city" #"perlin|city"
     # --- Sim / world ---
@@ -24,7 +24,7 @@ class TeleopConfig:
     world_pose_topic: str = "/world/airport/pose/info"
 
     # --- Teleop dynamics ---
-    rate_hz: float = 30
+    rate_hz: float = 100
     speed_x: float = 5.0
     speed_y: float = 5.0
     speed_z: float = 5.0
@@ -61,7 +61,7 @@ class TeleopConfig:
     # If True, keep runs where either strategy timed out; if False, drop them
     analyzer_include_timeouts: bool = True
     analyzer_strategies = ["APE1", "APE2", "APE3", "TROOP"]
-    #analyzer_strategies = ["APE2"]
+    #analyzer_strategies = ["TROOP"]
 
     # =======================
     # Generated Simulation & Algo Selector
