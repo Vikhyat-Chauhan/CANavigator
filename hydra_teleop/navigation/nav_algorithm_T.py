@@ -1065,7 +1065,7 @@ class LidarTargetNavigatorTROOP:
                             #print("RESOLVED BY ", _, " at ", prop["ready_t"])
                             self._evt_resolved = True
                             #self._evt_clear()   # always clear after first use
-                            #self._evt_deadline_at = 0
+                            
 
             # ---------- Avoidance / heading select ----------
             if stale:

@@ -6,7 +6,7 @@ from typing import Optional, Tuple, List
 @dataclass
 class TeleopConfig:
     # --- Run Options ---
-    simulation_runs = 1
+    simulation_runs = 1000
     simulation_timeout = 200
     simulation_world_style = "city" #"perlin|city"
     # --- Sim / world ---
@@ -133,12 +133,7 @@ class TeleopConfig:
     # -----------------------
     # Physics
     # -----------------------
-    # Deterministic
-    cmd_latency_s: float = 0.0 #0.10
-    wind_level_0to1: float = 0.0 #0.5
-    wind_accel_std_base_mps2: float = 0.0 #0.8
-    '''
     # Non Deterministic
     cmd_latency_s: float = 0.10
     wind_level_0to1: float = 0.5
-    wind_accel_std_base_mps2: float = 0.8  '''
+    wind_accel_std_base_mps2: float = 0.8
