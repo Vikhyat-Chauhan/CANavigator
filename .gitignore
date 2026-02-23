@@ -1,10 +1,44 @@
-# Ignore Python virtual environment
+# Python
 venv/
-models/generated/
-third_party/
-logs/
-# Ignore Python cache files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Generated simulation assets
+models/generated/
+
+# Third-party vendored code
+third_party/
+
+# Runtime logs and results
+logs/
+
+# Data archives (experiment result snapshots)
+*.zip
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Meeting notes (not project code)
+Meeting.md
+
+# Extracted data directories (experiment snapshots)
+city5001Filter/
+city851&1181/
+
+# Misc
+.bashrc
+lidar_view.rviz
