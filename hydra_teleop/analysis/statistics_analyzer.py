@@ -3,30 +3,43 @@ from __future__ import annotations
 import os, re
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from typing import Dict, Any
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # -------------------------------------------------------------------
-# Bettendorf-aware one-shot analysis
+# Bettendorf-aware one-shot analysis (summary only)
 # -------------------------------------------------------------------
 def run_analysis(
-    order=("APE1", "APE2", "APE3", "TROOP"),
-    deadline_ok_tol: float = 0.0,   # admissible if deadline_violation_rate <= this
+    order=("APE1", "APE2", "APE3", "TROOP"),  # kept for signature compatibility (unused)
+    deadline_ok_tol: float = 0.0,             # kept for signature compatibility (unused)
+    zone_metric: str = "median",              # kept for signature compatibility; controls filename only
 ) -> Dict[str, Any]:
     """
-    Analyze experiment CSV (B-style) and pick the winner.
+    Summarize experiment CSV (B-style) per strategy.
 
     TeleopConfig (STRICT):
       - cfg.results_csv_path  : str
       - cfg.analyzer_out_dir  : str
 
-    CSV (case-insensitive accepted):
-      strategy | reached | elapse_time | event_violated
-      [optional] events_handled | zone_violations
+    EXPECTED CSV (case-insensitive; REQUIRED):
+      strategy | elapse_time | zone_violations | energy_kj | mean_power_kw
+
+    OPTIONAL BUT SUPPORTED IF PRESENT:
+      run                # run index (1..N)
+      compute_energy_kj  # CPU-side compute energy in kJ
+      compute_energy_j   # legacy name for CPU energy (if present, treated as kJ-equivalent for stats)
+      events_handled
+      event_violations
+      event_violation_rate
+
+    NOTE:
+      - We no longer require or use a 'reached' column; the runner only writes
+        rows for fully successful runs where all strategies reached the target.
+      - We also drop any timeout-based metrics that depended on 'reached'.
     """
+    zm = str(zone_metric).strip().lower()
+    if zm not in {"median", "mean"}:
+        raise ValueError("zone_metric must be 'median' or 'mean'")
+
     # --- Strict dependency on TeleopConfig ---
     from hydra_teleop.config import TeleopConfig
     cfg = TeleopConfig()
@@ -57,66 +70,91 @@ def run_analysis(
                 return c
         raise KeyError(f"Missing required column: '{col_name_expected}'. Found columns: {list(df_raw.columns)}")
 
+    def resolve_opt(col_name_expected: str) -> str | None:
+        expected_lower = col_name_expected.strip().lower()
+        for c in df_raw.columns:
+            if c.strip().lower() == expected_lower:
+                return c
+        patt = re.compile(rf"^{re.escape(col_name_expected)}$", re.I)
+        for c in df_raw.columns:
+            if patt.search(c):
+                return c
+        return None  # optional
+
+    # Required columns (case-insensitive)
     COL = {
-        "strategy": resolve("strategy"),
-        "reached": resolve("reached"),
-        "elapsed": resolve("elapse_time"),
-        "deadline_violation": resolve("event_violated"),
+        "strategy":        resolve("strategy"),
+        "elapsed":         resolve("elapse_time"),
+        "zone_violations": resolve("zone_violations"),
+        "energy_kj":       resolve("energy_kj"),
+        "mean_power_kw":   resolve("mean_power_kw"),
     }
-    try:
-        COL["events_handled"] = resolve("events_handled")
-    except KeyError:
-        COL["events_handled"] = None
-    try:
-        COL["zone_violations"] = resolve("zone_violations")
-    except KeyError:
-        COL["zone_violations"] = None
+
+    # Optional / legacy columns
+    col_run = resolve_opt("run")
+    col_compute_kj = resolve_opt("compute_energy_kj")
+    col_compute_j_legacy = resolve_opt("compute_energy_j")  # legacy transformer output
+    col_events_handled = resolve_opt("events_handled")
+    col_event_violations = resolve_opt("event_violations")
+    col_event_violation_rate = resolve_opt("event_violation_rate")
 
     # ---------- Coercions ----------
-    def to_bool(s: pd.Series) -> pd.Series:
-        mapping = {
-            "true": True, "1": True, "yes": True, "y": True, "t": True,
-            "false": False, "0": False, "no": False, "n": False, "f": False
-        }
-        def conv(v):
-            if pd.isna(v): return np.nan
-            t = str(v).strip().lower()
-            return mapping.get(t, np.nan)
-        return s.map(conv)
-
     def to_num(s: pd.Series) -> pd.Series:
         return pd.to_numeric(s, errors="coerce")
 
-    df = pd.DataFrame({
-        "_strategy": df_raw[COL["strategy"]].astype(str).str.strip(),
-        "_reached": to_bool(df_raw[COL["reached"]]),
-        "_elapsed_s": to_num(df_raw[COL["elapsed"]]),
-        "_deadline_violation": to_bool(df_raw[COL["deadline_violation"]]),
-        "_events_handled": to_num(df_raw[COL["events_handled"]]) if COL["events_handled"] else np.nan,
-        "_zone_viol": to_num(df_raw[COL["zone_violations"]]) if COL["zone_violations"] else 0.0,
-    })
+    # pick whichever compute-energy column exists
+    compute_energy_col = col_compute_kj or col_compute_j_legacy
 
-    # ---------- Round filter (retain only successful reaches; enforce sequence blocks) ----------
-    valid = []
-    skip_until_next_ape1 = False
-    for idx, r in df.iterrows():
-        strat = r["_strategy"]
-        in_order = strat in order
-        if in_order and strat == order[0]:  # APE1 resets a "round"
-            skip_until_next_ape1 = False
-        if in_order and skip_until_next_ape1:
-            continue
-        if not (isinstance(r["_reached"], (bool, np.bool_)) and bool(r["_reached"])):
-            if in_order:
-                skip_until_next_ape1 = True
-            continue
-        valid.append(idx)
+    # Build normalized dataframe; missing optional columns become NaN
+    data = {
+        "_strategy":      df_raw[COL["strategy"]].astype(str).str.strip(),
+        "_elapsed_s":     to_num(df_raw[COL["elapsed"]]),
+        "_zone_viol":     to_num(df_raw[COL["zone_violations"]]),
+        "_energy_kj":     to_num(df_raw[COL["energy_kj"]]),
+        "_mean_power_kw": to_num(df_raw[COL["mean_power_kw"]]),
+    }
 
-    df_f = df.loc[valid].copy()
+    if compute_energy_col is not None:
+        data["_compute_energy"] = to_num(df_raw[compute_energy_col])
+    else:
+        data["_compute_energy"] = pd.Series(np.nan, index=df_raw.index, dtype=float)
+
+    if col_events_handled is not None:
+        data["_events_handled"] = to_num(df_raw[col_events_handled])
+    else:
+        data["_events_handled"] = pd.Series(np.nan, index=df_raw.index, dtype=float)
+
+    if col_event_violations is not None:
+        data["_event_violations"] = to_num(df_raw[col_event_violations])
+    else:
+        data["_event_violations"] = pd.Series(np.nan, index=df_raw.index, dtype=float)
+
+    if col_event_violation_rate is not None:
+        data["_event_violation_rate"] = to_num(df_raw[col_event_violation_rate])
+    else:
+        data["_event_violation_rate"] = pd.Series(np.nan, index=df_raw.index, dtype=float)
+
+    if col_run is not None:
+        data["_run"] = to_num(df_raw[col_run])
+    else:
+        data["_run"] = pd.Series(np.nan, index=df_raw.index, dtype=float)
+
+    df = pd.DataFrame(data)
+
+    # NOTE:
+    # We *do not* do any round-filtering based on 'reached' anymore.
+    # The runner only writes rows for "good runs" where all strategies reached.
+    df_f = df.copy()
     if df_f.empty:
-        raise SystemExit("No valid rows after round filtering.")
+        empty_csv = os.path.join(out_dir, f"strategy_summary_zone-{zm}.csv")
+        pd.DataFrame().to_csv(empty_csv, index=False)
+        return {
+            "zone_metric": zm,
+            "summary_csv": empty_csv,
+            "summary": {},
+        }
 
-    # ---------- Per-strategy metrics ----------
+    # ---------- Per-strategy summary on all (already-successful) data ----------
     g = df_f.groupby("_strategy", dropna=False)
 
     def med(s: pd.Series) -> float:
@@ -127,166 +165,43 @@ def run_analysis(
         s = s.dropna()
         return float(np.percentile(s, 95)) if len(s) else float("nan")
 
-    def any_zone(s: pd.Series) -> float:
+    def any_pos(s: pd.Series) -> float:
         s = s.dropna()
-        if not len(s): return float("nan")
+        if not len(s):
+            return float("nan")
         return float((s > 0).mean())
 
     summary = pd.DataFrame({
-        "runs_considered": g.size(),
-        "deadline_violation_rate": g["_deadline_violation"].mean(),
-        "reach_time_median_s": g["_elapsed_s"].apply(med),
-        "reach_time_mean_s": g["_elapsed_s"].mean(),
-        "reach_time_p95_s": g["_elapsed_s"].apply(p95),
-        "zone_violations_mean": g["_zone_viol"].mean(),
+        "runs_considered":        g.size(),
+        "reach_time_median_s":    g["_elapsed_s"].apply(med),
+        "reach_time_mean_s":      g["_elapsed_s"].mean(),
+        "reach_time_p95_s":       g["_elapsed_s"].apply(p95),
+        "zone_violations_mean":   g["_zone_viol"].mean(),
         "zone_violations_median": g["_zone_viol"].median(),
-        "p_any_zone_violation": g["_zone_viol"].apply(any_zone),
+        "p_any_zone_violation":   g["_zone_viol"].apply(any_pos),
+        "energy_kj_median":       g["_energy_kj"].median(),
+        "mean_power_kw_mean":     g["_mean_power_kw"].mean(),
     })
 
-    # Validation: required fields for ranking
-    required_cols = ["deadline_violation_rate", "reach_time_median_s", "zone_violations_mean"]
-    nan_mask = summary[required_cols].isna()
-    if nan_mask.any().any():
-        problems = []
-        for strat, row in nan_mask.iterrows():
-            missing_fields = [col for col, is_nan in row.items() if is_nan]
-            if missing_fields:
-                problems.append(f"{strat}: missing {', '.join(missing_fields)}")
-        details = "; ".join(problems) if problems else "unknown"
-        raise ValueError(
-            "Missing values detected in required metrics; cannot rank/Pareto with incomplete data. "
-            f"Please fix your input CSV or drop problematic rows.\nDetails: {details}"
-        )
+    # Compute-energy summary (if present)
+    if not df_f["_compute_energy"].isna().all():
+        summary["compute_energy_median"] = g["_compute_energy"].apply(med)
 
-    # Per-event violation rate (if possible)
-    if COL["events_handled"]:
-        total_viols = g["_deadline_violation"].sum(min_count=1)
-        total_events = g["_events_handled"].sum(min_count=1)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            per_event = total_viols / total_events
-        summary["per_event_violation_rate"] = per_event
+    # Event-related summaries (if present)
+    if not df_f["_event_violation_rate"].isna().all():
+        summary["event_violation_rate_mean"] = g["_event_violation_rate"].mean()
+        summary["event_violation_rate_p95"] = g["_event_violation_rate"].apply(p95)
 
-    # ---------- Admissibility (Bettendorf: deadlines are hard) ----------
-    summary["admissible"] = summary["deadline_violation_rate"] <= float(deadline_ok_tol)
+    if not df_f["_event_violations"].isna().all():
+        summary["event_violations_mean"] = g["_event_violations"].mean()
+        summary["p_any_event_violation"] = g["_event_violations"].apply(any_pos)
 
-    # ---------- Lexicographic winner (deadline → time → zone → runs) ----------
-    S = summary.copy()
-    S["reach_time_median_s_rank"] = S["reach_time_median_s"]
-    S["zone_violations_mean_rank"] = S["zone_violations_mean"]
-    S_sort = S.sort_values(
-        by=["deadline_violation_rate", "reach_time_median_s_rank", "zone_violations_mean_rank", "runs_considered"],
-        ascending=[True, True, True, False]
-    )
-    best_strategy = S_sort.index[0]
-    best_row = S.loc[best_strategy]
+    # ---------- Write summary CSV and return ----------
+    summary_csv = os.path.join(out_dir, f"strategy_summary_zone-{zm}.csv")
+    summary.round(6).to_csv(summary_csv)
 
-    # ---------- Pareto set on (deadline, time, zone) ----------
-    vals = S[["deadline_violation_rate", "reach_time_median_s_rank", "zone_violations_mean_rank"]].values
-    pareto = np.ones(len(S), dtype=bool)
-    for i, vi in enumerate(vals):
-        if not pareto[i]:
-            continue
-        # any j dominates i if j <= i in all coords and < in at least one
-        dom = (vals <= vi).all(axis=1) & (vals < vi).any(axis=1)
-        dom &= (np.arange(len(S)) != i)
-        if dom.any():
-            pareto[i] = False
-    S["pareto_optimal"] = pareto
-
-    # ---------- Write summary CSV ----------
-    summary_csv = os.path.join(out_dir, "strategy_summary.csv")
-    S.round(6).to_csv(summary_csv)
-
-    # ---------- Plots ----------
-    # 2D: violation rate vs median reach; bubble=size zone_mean; star on Pareto; green edge if admissible
-    plt.figure(figsize=(7, 5))
-    x = S["deadline_violation_rate"].values
-    y = S["reach_time_median_s"].values
-    sizes = (S["zone_violations_mean"].values + 0.05) * 1000
-    colors = ["tab:blue"] * len(S)
-    edges = ["tab:green" if adm else "k" for adm in S["admissible"].values]
-    plt.scatter(x, y, s=sizes, c=colors, edgecolors=edges, linewidths=1.2)
-    for name, xv, yv, is_p in zip(S.index, x, y, S["pareto_optimal"].values):
-        if np.isfinite(yv):
-            lbl = f"{name}{' *' if is_p else ''}"
-            plt.annotate(lbl, (xv, yv), textcoords="offset points", xytext=(5, 5))
-    plt.xlabel("Deadline violation rate (per run)")
-    plt.ylabel("Median reach time (s)")
-    plt.title("Trade-offs per strategy (size = mean zone violations; green edge = admissible)")
-    plt.tight_layout()
-    plot2d = os.path.join(out_dir, "tradeoff_2d.png")
-    plt.savefig(plot2d, dpi=160)
-    plt.close()
-
-    # 2D: MEAN zone violations vs deadline violation rate
-    plt.figure(figsize=(7, 5))
-    x2 = S["deadline_violation_rate"].values
-    y2 = S["zone_violations_mean"].values
-    plt.scatter(x2, y2, edgecolors=edges, linewidths=1.0)
-    for name, xv, yv in zip(S.index, x2, y2):
-        if np.isfinite(yv):
-            plt.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5))
-    plt.xlabel("Deadline violation rate (per run)")
-    plt.ylabel("Mean zone violations (per run)")
-    plt.title("Mean Zone Violations vs Deadline Violation Rate")
-    plt.tight_layout()
-    plot2d_zoneMean_vs_deadline = os.path.join(out_dir, "tradeoff_2d_zoneMean_vs_deadline.png")
-    plt.savefig(plot2d_zoneMean_vs_deadline, dpi=160)
-    plt.close()
-
-    # 2D: MEDIAN reach time vs MEAN zone violations
-    plt.figure(figsize=(7, 5))
-    x3 = S["zone_violations_mean"].values
-    y3 = S["reach_time_median_s"].values
-    plt.scatter(x3, y3, edgecolors=edges, linewidths=1.0)
-    for name, xv, yv in zip(S.index, x3, y3):
-        if np.isfinite(yv):
-            plt.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5))
-    plt.xlabel("Mean zone violations (per run)")
-    plt.ylabel("Median reach time (s)")
-    plt.title("Median Reach Time vs Mean Zone Violations")
-    plt.tight_layout()
-    plot2d_reachMedian_vs_zoneMean = os.path.join(out_dir, "tradeoff_2d_reachMedian_vs_zoneMean.png")
-    plt.savefig(plot2d_reachMedian_vs_zoneMean, dpi=160)
-    plt.close()
-
-    # 3D: (violations, reach_time, zone_mean)
-    fig = plt.figure(figsize=(7, 5))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(
-        S["deadline_violation_rate"].values,
-        S["reach_time_median_s"].values,
-        S["zone_violations_mean"].values,
-    )
-    for name, xv, yv, zv in zip(S.index, S["deadline_violation_rate"].values, S["reach_time_median_s"].values, S["zone_violations_mean"].values):
-        if np.isfinite(yv):
-            ax.text(xv, yv, zv, name)
-    ax.set_xlabel("Deadline violation rate")
-    ax.set_ylabel("Median reach time (s)")
-    ax.set_zlabel("Mean zone violations")
-    ax.set_title("3D Trade-off Landscape")
-    plt.tight_layout()
-    plot3d = os.path.join(out_dir, "tradeoff_3d.png")
-    plt.savefig(plot3d, dpi=160)
-    plt.close()
-
-    # ---------- Return compact result ----------
     return {
-        "best_strategy": str(best_strategy),
-        "metrics": {
-            "deadline_violation_rate": float(S.loc[best_strategy, "deadline_violation_rate"]),
-            "reach_time_median_s": float(S.loc[best_strategy, "reach_time_median_s"]),
-            "reach_time_p95_s": float(S.loc[best_strategy, "reach_time_p95_s"]),
-            "zone_violations_mean": float(S.loc[best_strategy, "zone_violations_mean"]),
-            "p_any_zone_violation": float(S.loc[best_strategy, "p_any_zone_violation"]),
-            "per_event_violation_rate": float(S.loc[best_strategy, "per_event_violation_rate"]) if "per_event_violation_rate" in S.columns and not pd.isna(S.loc[best_strategy, "per_event_violation_rate"]) else None,
-            "runs_considered": int(S.loc[best_strategy, "runs_considered"]),
-            "admissible": bool(S.loc[best_strategy, "admissible"]),
-            "pareto_optimal": bool(S.loc[best_strategy, "pareto_optimal"]),
-        },
+        "zone_metric": zm,
         "summary_csv": summary_csv,
-        "plot_2d": plot2d,
-        "plot_3d": plot3d,
-        "plot_2d_zoneMean_vs_deadline": plot2d_zoneMean_vs_deadline,
-        "plot_2d_reachMedian_vs_zoneMean": plot2d_reachMedian_vs_zoneMean,
+        "summary": summary.round(6).to_dict(orient="index"),
     }

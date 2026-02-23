@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-# hydra_teleop/event_emitter.py (B-style) — with reset() support
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-import json, time, threading, random, math, csv, os
+# hydra_teleop/event_emitter.py — deterministic emission on flag
 
-import rclpy
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+import json, time, threading, random, math, csv, os
 from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
+# Pose is only used in non-deterministic mode
 from geometry_msgs.msg import PoseStamped
 
 from hydra_teleop.config import TeleopConfig
@@ -16,80 +15,47 @@ from hydra_teleop.config import TeleopConfig
 # ----------------------------- Config -----------------------------
 @dataclass
 class EventCfg:
-    topic: str = "/hydra/event"
+    # ---- The only two user-facing knobs ----
     seed: Optional[int] = None
+    event_deterministic: bool = False
 
-    # Timing parameters (log-uniform inter-arrival)
-    dt_min_s: float = 0.02
-    dt_max_s: float = 4.0
+    # ---- Fixed defaults (not meant to be tuned) ----
+    topic: str = field(default="/hydra/event", init=False)
+    dt_min_s: float = field(default=0.02, init=False)   # log-uniform Δt min
+    dt_max_s: float = field(default=4.0, init=False)    # log-uniform Δt max
 
-    # Optional fixed global deadline. If None, we derive per-event deadlines from Δt.
-    global_deadline_s: Optional[float] = None
-    # B-style: deadline = clamp( α * Δt , [deadline_min_s, deadline_max_s] )
-    deadline_alpha: float = 0.80
-    deadline_min_s: float = 0.12
-    deadline_max_s: float = 1.2
+    # Deadline model: deadline = clamp(α * Δt, [min, max])
+    deadline_alpha: float = field(default=0.80, init=False)
+    deadline_min_s: float = field(default=0.12, init=False)
+    deadline_max_s: float = field(default=1.20, init=False)
+    global_deadline_s: Optional[float] = field(default=None, init=False)
 
     # Event mix probabilities
-    mix_enemy: float = 0.33
-    mix_obstacle: float = 0.33
-    mix_lane: float = 0.34
+    mix_enemy: float = field(default=0.33, init=False)
+    mix_obstacle: float = field(default=0.33, init=False)
+    mix_lane: float = field(default=0.34, init=False)
 
-    # Arena bounds
-    x_min: float = -100.0; x_max: float = 100.0
-    y_min: float =  -50.0; y_max: float =   50.0
-
-    # Drone pose topic
-    drone_pose_topic: str = "/model/drone1/pose/info"
-
-    # Geometry parameters (kept identical)
-    enemy_speed_min: float = 1.0
-    enemy_speed_max: float = 4.0
-    enemy_radius_min: float = 1.0
-    enemy_radius_max: float = 3.0
-    enemy_cross_dist_ahead: float = 15.0
-    enemy_cross_lateral: float = 8.0
-
-    obstacle_radius_min: float = 1.0
-    obstacle_radius_max: float = 2.5
-    obstacle_ahead_min: float = 8.0
-    obstacle_ahead_max: float = 20.0
-    obstacle_side_span: float = 10.0
-
-    lane_w_min: float = 6.0
-    lane_w_max: float = 12.0
-    lane_h_min: float = 4.0
-    lane_h_max: float = 10.0
-    lane_ahead_min: float = 15.0
-    lane_ahead_max: float = 35.0
-
-    # Logging
-    log_csv_path: Optional[str] = "events_log.csv"
+    # CSV log
+    log_csv_path: Optional[str] = field(default="logs/events_log.csv", init=False)
 
     @staticmethod
     def from_teleop_cfg(cfg: TeleopConfig) -> "EventCfg":
-        bounds = getattr(cfg, "event_bounds_xy", (-100.0, 100.0, -50.0, 50.0))
         return EventCfg(
-            topic=getattr(cfg, "event_topic", "/hydra/event"),
             seed=getattr(cfg, "event_seed", None),
-            dt_min_s=float(getattr(cfg, "event_dt_min_s", 0.02)),
-            dt_max_s=float(getattr(cfg, "event_dt_max_s", 4.0)),
-            global_deadline_s=getattr(cfg, "event_global_deadline_s", None),
-            deadline_alpha=float(getattr(cfg, "deadline_alpha", 0.85)),
-            deadline_min_s=float(getattr(cfg, "deadline_min_s", 0.12)),
-            deadline_max_s=float(getattr(cfg, "deadline_max_s", 1.20)),
-            mix_enemy=float(getattr(cfg, "event_mix_enemy", 0.33)),
-            mix_obstacle=float(getattr(cfg, "event_mix_obstacle", 0.33)),
-            mix_lane=float(getattr(cfg, "event_mix_lane", 0.34)),
-            x_min=float(bounds[0]), x_max=float(bounds[1]),
-            y_min=float(bounds[2]), y_max=float(bounds[3]),
-            drone_pose_topic=getattr(cfg, "ros_pose_topic", "/model/drone1/pose/info"),
-            log_csv_path=getattr(cfg, "event_log_csv_path", "events_log.csv"),
+            event_deterministic=bool(getattr(cfg, "event_deterministic", False)),
         )
 
 # ----------------------------- Emitter -----------------------------
 class EventEmitter(Node):
-    """B-style event emitter: log-uniform inter-arrival Δt defines constraint pressure."""
+    """
+    Event emitter.
+    - If cfg.event_deterministic == True:
+        * Emission timing, types, and deadlines are purely RNG-based from `seed`.
+        * Ignores drone pose and uses a logical clock (t=0, t+=Δt).
+        * Meta is minimal and stable: {"i": idx, "kind": "..."}.
+    - If False (default behavior preserved):
+        * Uses wall-clock deltas and optional pose-derived geometry.
+    """
 
     def __init__(self, teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None):
         super().__init__("hydra_event_emitter")
@@ -97,17 +63,22 @@ class EventEmitter(Node):
         self._rnd = random.Random(self._cfg.seed)
 
         self._pub = self.create_publisher(String, self._cfg.topic, 10)
+
+        # Only subscribe to pose in non-deterministic (geometry) mode
         self._pose_lock = threading.Lock()
         self._pose_latest: Optional[PoseStamped] = None
-        self.create_subscription(PoseStamped, self._cfg.drone_pose_topic, self._on_pose, 10)
+        if not self._cfg.event_deterministic:
+            pose_topic = getattr(teleop_cfg, "ros_pose_topic", "/model/drone1/pose/info")
+            self.create_subscription(PoseStamped, pose_topic, self._on_pose, 10)
 
-        self._exec = SingleThreadedExecutor()
-        self._exec.add_node(self)
         self._stop_flag = threading.Event()
-        self._spin_thread: Optional[threading.Thread] = None
         self._exp_thread: Optional[threading.Thread] = None
 
-        # CSV logging setup
+        # Deterministic logical clock + index
+        self._t_logical = 0.0
+        self._i = 0
+
+        # CSV logging
         self._csv_fp = None
         if self._cfg.log_csv_path:
             os.makedirs(os.path.dirname(self._cfg.log_csv_path) or ".", exist_ok=True)
@@ -117,25 +88,17 @@ class EventEmitter(Node):
 
     # ---------------- Lifecycle ----------------
     def start(self):
-        if self._spin_thread is None:
-            self._stop_flag.clear()
-            self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
-            self._spin_thread.start()
+        # no executor spin here; the app adds this node to its shared executor
         if self._exp_thread is None:
+            self._stop_flag.clear()
             self._exp_thread = threading.Thread(target=self._loop, daemon=True)
             self._exp_thread.start()
 
     def stop(self, destroy: bool = True):
-        """
-        Stop threads. If destroy=False, keep node/publisher and CSV open so we can reset().
-        """
         self._stop_flag.set()
         if self._exp_thread:
-            self._exp_thread.join(timeout=1.0)
-        if self._spin_thread:
-            self._spin_thread.join(timeout=1.0)
+            self._exp_thread.join()
         self._exp_thread = None
-        self._spin_thread = None
 
         if destroy:
             if self._csv_fp:
@@ -145,124 +108,122 @@ class EventEmitter(Node):
                     self._csv_fp.close()
                 self._csv_fp = None
             try:
-                self._exec.remove_node(self)
+                self.destroy_node()
             except Exception:
                 pass
-            self.destroy_node()
 
     def reset(self):
-        """
-        Reset RNG to the initial seed and restart emission so the event sequence repeats.
-        Keeps the same ROS node, publisher, and CSV file.
-        """
-        # Stop threads but do not destroy node/pubs or close CSV
+        """Deterministic reset: rewind RNG/clock/index; keep node & CSV open."""
         self.stop(destroy=False)
-        # Rewind RNG to the original seed so the random sequence repeats
         self._rnd = random.Random(self._cfg.seed)
-        # Clear stop flag and restart threads
+        self._t_logical = 0.0
+        self._i = 0
         self._stop_flag.clear()
         self.start()
 
-    def _spin_loop(self):
-        while rclpy.ok() and not self._stop_flag.is_set():
-            self._exec.spin_once(timeout_sec=0.01)
-
+    # ---------------- Internals ----------------
     def _on_pose(self, msg: PoseStamped):
         with self._pose_lock:
             self._pose_latest = msg
 
-    def _get_pose_xyyaw(self) -> Optional[Tuple[float, float, float]]:
-        with self._pose_lock:
-            msg = self._pose_latest
-        if not msg: return None
-        p = msg.pose.position; o = msg.pose.orientation
-        t0 = +2.0 * (o.w * o.z + o.x * o.y)
-        t1 = +1.0 - 2.0 * (o.y * o.y + o.z * o.z)
-        yaw = math.atan2(t0, t1)
-        return p.x, p.y, yaw
+    def _draw_dt(self) -> float:
+        # Δt ~ log-uniform(dt_min, dt_max)
+        return math.exp(self._rnd.uniform(math.log(self._cfg.dt_min_s), math.log(self._cfg.dt_max_s)))
+
+    def _deadline_from_dt(self, delta_t: float) -> float:
+        if self._cfg.global_deadline_s is not None:
+            return float(self._cfg.global_deadline_s)
+        d = self._cfg.deadline_alpha * float(delta_t)
+        return max(self._cfg.deadline_min_s, min(self._cfg.deadline_max_s, d))
+
+    def _choose_kind(self) -> str:
+        r = self._rnd.random()
+        if r < self._cfg.mix_enemy: return "ENEMY"
+        if r < self._cfg.mix_enemy + self._cfg.mix_obstacle: return "SUDDEN_OBSTACLE"
+        return "LANE_BLOCK"
 
     # ---------------- Main Loop ----------------
     def _loop(self):
-        last_emit_t = time.time()
+        last_wall_t = time.time()
         while not self._stop_flag.is_set():
-            # Wait Δt ~ log-uniform(dt_min, dt_max)
-            dt = math.exp(self._rnd.uniform(math.log(self._cfg.dt_min_s), math.log(self._cfg.dt_max_s)))
-            time.sleep(dt)
+            dt = self._draw_dt()
+            # Interruptible sleep: exits immediately when stop() sets the flag
+            if self._stop_flag.wait(dt):
+                break
 
-            now = time.time()
-            delta_t = now - last_emit_t
-            last_emit_t = now
-
-            # Choose event kind
-            r = self._rnd.random()
-            if r < self._cfg.mix_enemy:
-                self._emit_enemy(delta_t)
-            elif r < self._cfg.mix_enemy + self._cfg.mix_obstacle:
-                self._emit_obstacle(delta_t)
+            if self._cfg.event_deterministic:
+                # Purely logical timing & deterministic delta
+                self._t_logical += dt
+                delta_t = dt
+                t_emit = self._t_logical
+                kind = self._choose_kind()
+                meta = {"i": self._i, "kind": kind}
+                self._i += 1
             else:
-                self._emit_lane(delta_t)
+                # Wall-clock delta; kind/geometry still seeded but may use pose
+                now = time.time()
+                delta_t = now - last_wall_t
+                last_wall_t = now
+                t_emit = now
+                kind = self._choose_kind()
+                meta = self._make_meta_nondet(kind)
 
-    # ---------------- Emitters ----------------
-    def _emit(self, kind: str, meta: Dict[str, Any], delta_t: float):
-        # If a fixed global deadline is not provided, derive it from Δt (pressure model)
-        derived_deadline = (
-            self._cfg.global_deadline_s
-            if self._cfg.global_deadline_s is not None
-            else max(self._cfg.deadline_min_s,
-                     min(self._cfg.deadline_max_s, self._cfg.deadline_alpha * float(delta_t)))
-        )
-        obj = {
-            "kind": kind,
-            "t_emit": time.time(),
-            "deadline_s": derived_deadline,
-            "meta": meta,
-        }
-        msg = String(); msg.data = json.dumps(obj)
-        self._pub.publish(msg)
-        if self._csv_fp:
-            self._csv.writerow([obj["t_emit"], kind, obj["deadline_s"], json.dumps(meta)])
+            # Emit
+            deadline = self._deadline_from_dt(delta_t)
+            obj = {"kind": kind, "t_emit": t_emit, "deadline_s": deadline, "meta": meta}
+            msg = String(); msg.data = json.dumps(obj)
+            # Guard publish in case shutdown raced ahead
+            if self._stop_flag.is_set():
+                break
+            try:
+                self._pub.publish(msg)
+            except Exception as e:
+                # Likely shutdown in progress; exit cleanly
+                try:
+                    self.get_logger().warn(f"publish aborted during shutdown: {e}")
+                except Exception:
+                    pass
+                break
+            if self._csv_fp:
+                self._csv.writerow([obj["t_emit"], kind, obj["deadline_s"], json.dumps(meta)])
 
-    def _emit_enemy(self, delta_t: float):
-        pose = self._get_pose_xyyaw()
-        if pose:
-            x, y, yaw = pose
-            ahead = self._cfg.enemy_cross_dist_ahead
-            lateral = self._cfg.enemy_cross_lateral * (1 if self._rnd.random() < 0.5 else -1)
-            cx = x + ahead * math.cos(yaw) - lateral * math.sin(yaw)
-            cy = y + ahead * math.sin(yaw) + lateral * math.cos(yaw)
-        else:
-            cx = self._rnd.uniform(self._cfg.x_min, self._cfg.x_max)
-            cy = self._rnd.uniform(self._cfg.y_min, self._cfg.y_max)
-        speed = self._rnd.uniform(self._cfg.enemy_speed_min, self._cfg.enemy_speed_max)
-        vx, vy = -speed * math.sin(yaw if pose else 0), speed * math.cos(yaw if pose else 0)
-        rad = self._rnd.uniform(self._cfg.enemy_radius_min, self._cfg.enemy_radius_max)
-        self._emit("ENEMY", {"pos": [cx, cy], "vel": [vx, vy], "radius": rad}, delta_t)
+    # ---------------- Non-deterministic meta (kept minimal) ----------------
+    def _make_meta_nondet(self, kind: str) -> Dict[str, Any]:
+        if kind == "ENEMY":
+            # Minimal stable-ish placeholder without strict geometry needs
+            return {"speed": round(self._rnd.uniform(1.0, 4.0), 3)}
+        if kind == "SUDDEN_OBSTACLE":
+            return {"radius": round(self._rnd.uniform(1.0, 2.5), 3)}
+        # LANE_BLOCK
+        w = self._rnd.uniform(6.0, 12.0)
+        h = self._rnd.uniform(4.0, 10.0)
+        return {"rect_wh": [round(w, 3), round(h, 3)]}
 
-    def _emit_obstacle(self, delta_t: float):
-        pose = self._get_pose_xyyaw()
-        if pose:
-            x, y, yaw = pose
-            ahead = self._rnd.uniform(self._cfg.obstacle_ahead_min, self._cfg.obstacle_ahead_max)
-            side = self._rnd.uniform(-self._cfg.obstacle_side_span, self._cfg.obstacle_side_span)
-            ox = x + ahead * math.cos(yaw) - side * math.sin(yaw)
-            oy = y + ahead * math.sin(yaw) + side * math.cos(yaw)
-        else:
-            ox = self._rnd.uniform(self._cfg.x_min, self._cfg.x_max)
-            oy = self._rnd.uniform(self._cfg.y_min, self._cfg.y_max)
-        rad = self._rnd.uniform(self._cfg.obstacle_radius_min, self._cfg.obstacle_radius_max)
-        self._emit("SUDDEN_OBSTACLE", {"pos": [ox, oy], "radius": rad}, delta_t)
+def make_event_emitter_node(teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None,
+                            callback_group=None) -> EventEmitter:
+    """
+    Construct the EventEmitter node (no spinning). Caller must:
+      1) add this node to their shared executor, and
+      2) call emitter.start() to begin emission thread.
+    """
+    node = EventEmitter(teleop_cfg, gen_cfg)
+    if callback_group is not None:
+        # assign the callback group to the subscription if present
+        try:
+            for sub in node.subscriptions:
+                sub.callback_group = callback_group
+        except Exception:
+            pass
+    return node
 
-    def _emit_lane(self, delta_t: float):
-        pose = self._get_pose_xyyaw()
-        if pose:
-            x, y, yaw = pose
-            ahead = self._rnd.uniform(self._cfg.lane_ahead_min, self._cfg.lane_ahead_max)
-            lateral = self._rnd.uniform(-0.5 * (self._cfg.lane_w_max + 4.0), 0.5 * (self._cfg.lane_w_max + 4.0))
-            cx = x + ahead * math.cos(yaw) - lateral * math.sin(yaw)
-            cy = y + ahead * math.sin(yaw) + lateral * math.cos(yaw)
-        else:
-            cx = self._rnd.uniform(self._cfg.x_min, self._cfg.x_max)
-            cy = self._rnd.uniform(self._cfg.y_min, self._cfg.y_max)
-        w = self._rnd.uniform(self._cfg.lane_w_min, self._cfg.lane_w_max)
-        h = self._rnd.uniform(self._cfg.lane_h_min, self._cfg.lane_h_max)
-        self._emit("LANE_BLOCK", {"rect": [cx, cy, w, h]}, delta_t)
+
+def add_event_emitter_to_executor(executor, teleop_cfg: TeleopConfig,
+                                  gen_cfg: Optional[EventCfg] = None,
+                                  callback_group=None) -> EventEmitter:
+    """
+    Convenience: make the emitter node and add it to the provided executor.
+    Returns the node (call .start() to begin emitting).
+    """
+    node = make_event_emitter_node(teleop_cfg, gen_cfg, callback_group=callback_group)
+    executor.add_node(node)
+    return node
