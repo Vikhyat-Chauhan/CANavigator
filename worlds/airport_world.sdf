@@ -127,7 +127,7 @@
 
     <!-- Drone -->
     <include>
-      <uri>file:///home/vikhyat-chauhan/Documents/Hydra/models/x3-uav/4</uri>
+      <uri>file:///home/vikhyat/Documents/Hydra/models/x3-uav/4</uri>
       <name>drone1</name>
       <pose>-95 0 1 0 0 0</pose> <!-- Hotfix : to prevent the drone from spawning in a restricted zone, have hardcoded the location to -95. (seems to be working for now) -->
 
@@ -138,13 +138,13 @@
 
     <!-- Auto-generated restricted zones -->
     <include>
-      <uri>file:///home/vikhyat-chauhan/Documents/Hydra/models/generated/generated_nofly.sdf</uri>
+      <uri>file:///home/vikhyat/Documents/Hydra/models/generated/generated_nofly.sdf</uri>
       <pose>0 0 0 0 0 0</pose>
     </include>
 
     <!-- Auto-generated per-run target -->
     <include>
-      <uri>file:///home/vikhyat-chauhan/Documents/Hydra/models/generated/generated_target.sdf</uri>
+      <uri>file:///home/vikhyat/Documents/Hydra/models/generated/generated_target.sdf</uri>
     </include>
 
   </world>

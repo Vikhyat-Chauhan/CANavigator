@@ -237,7 +237,7 @@ def main() -> None:
                 arena_gen = ArenaGenerator(
                     cfg,
                     ArenaGenCfg(
-                        seed=attempt_idx + cfg.world_gen_seed_offset,
+                        seed= cfg.world_gen_seed_offset + (0 if cfg.fixed_seed else attempt_idx),
                         target_min_dist=cfg.target_distance,
                         pass_through=True,
                         visual_alpha=0.0,
@@ -336,28 +336,6 @@ def main() -> None:
                     elapsed_by_strategy = {
                         rec["strategy"]: rec["elapsed"] for rec in buffered_records
                     }
-
-                    ordering_ok = False
-                    try:
-                        ape1_t = elapsed_by_strategy["APE1"]
-                        ape2_t = elapsed_by_strategy["APE2"]
-                        ape3_t = elapsed_by_strategy["APE3"]
-                        ordering_ok = True#(ape1_t > ape2_t > ape3_t)
-                    except KeyError:
-                        # If any of the APE strategies is missing, treat as invalid
-                        ordering_ok = False
-
-                    if not ordering_ok:
-                        print(
-                            f"⏭️  Attempt {attempt_idx} discarded: "
-                            f"elapsed time ordering violated "
-                            f"(need APE1>APE2>APE3, got "
-                            f"APE1={elapsed_by_strategy.get('APE1')}, "
-                            f"APE2={elapsed_by_strategy.get('APE2')}, "
-                            f"APE3={elapsed_by_strategy.get('APE3')})."
-                        )
-                        # Do NOT increment good_runs; skip writing to CSV.
-                        continue
 
                     # If we reach here, all strategies reached AND ordering is OK
                     good_runs += 1

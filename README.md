@@ -182,7 +182,7 @@ hydra/
 
 ```bash
 # Clone the repository
-git clone https://github.com/vikhyat-chauhan/Hydra.git
+git clone https://github.com/vikhyat/Hydra.git
 cd Hydra
 
 # Run the automated setup (installs dependencies, creates venv, runs experiment)
