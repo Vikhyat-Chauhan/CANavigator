@@ -11,8 +11,9 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 | `simulation_runs` | `int` | `1000` | Number of successful (good) runs to collect before stopping |
 | `simulation_timeout` | `int` | `200` | Per-strategy timeout in seconds; navigation aborts if exceeded |
 | `simulation_world_style` | `str` | `"city"` | Arena generation style: `"city"` (grid blocks) or `"perlin"` (noise-based) |
+| `fixed_seed` | `bool` | `False` | If `True`, all attempts use the same world seed (for debugging) |
 | `world_path` | `str` | `"worlds/airport_world.sdf"` | Path to the base Gazebo world SDF file |
-| `sim_cmd` | `tuple[str, ...]` | `("gz", "sim", "-r")` | Command to launch Gazebo; use `("-s", "-r")` for headless |
+| `sim_cmd` | `tuple[str, ...]` | `("gz", "sim", "-r", "-s")` | Command to launch Gazebo (`-s` = headless) |
 | `sim_env` | `dict \| None` | Auto-configured | Environment variables for Gazebo (GPU, display settings) |
 | `sim_boot_secs` | `float` | `8.0` | Seconds to wait for Gazebo to fully initialize |
 
@@ -24,7 +25,7 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 |---|---|---|---|
 | `world_gen_seed_offset` | `int` | `112` | Base offset added to attempt index for world RNG seed |
 | `target_distance` | `int` | `150` | Minimum Euclidean distance (meters) from start to target |
-| `perlin_seed_list` | `list[int]` | `[1..999]` | Pool of seeds for Perlin-noise arena generation |
+| `target_json_path` | `str` | `"models/generated/generated_target_meta.json"` | Path to the generated target position JSON |
 
 ---
 
@@ -42,10 +43,6 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `rate_hz` | `float` | `100` | Control loop frequency in Hz |
-| `speed_x` | `float` | `5.0` | Maximum forward/backward velocity (m/s) |
-| `speed_y` | `float` | `5.0` | Maximum lateral velocity (m/s) |
-| `speed_z` | `float` | `5.0` | Maximum vertical velocity (m/s) |
-| `yaw_rate` | `float` | `0.8` | Maximum yaw angular velocity (rad/s) |
 
 ---
 
@@ -56,29 +53,21 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 | `start_x` | `float` | `-95.0` | Drone start position X (meters) |
 | `start_y` | `float` | `0.0` | Drone start position Y (meters) |
 | `start_z` | `float` | `1.0` | Drone start position Z (meters) |
-| `start_roll` | `float` | `0.0` | Drone start roll (radians) |
-| `start_pitch` | `float` | `0.0` | Drone start pitch (radians) |
 | `start_yaw` | `float` | `0.0` | Drone start yaw (radians) |
 
 ---
 
 ## Event Generation
 
-### Timing Model
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `event_dt_min_s` | `float` | `0.08` | Minimum inter-event interval (log-uniform lower bound) |
-| `event_dt_max_s` | `float` | `3.5` | Maximum inter-event interval (log-uniform upper bound) |
-| `event_global_deadline_s` | `float \| None` | `None` | Optional single global deadline; usually `None` (delta-t acts as constraint) |
-
 ### Deadline Model
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `deadline_alpha` | `float` | `0.85` | Deadline fraction: `deadline = alpha * delta_t` |
-| `deadline_min_s` | `float` | `0.12` | Minimum deadline clamp (seconds) |
-| `deadline_max_s` | `float` | `1.20` | Maximum deadline clamp (seconds) |
+| `deadline_min_s` | `float` | `0.70` | Minimum deadline clamp (seconds) |
+| `deadline_max_s` | `float` | `3.50` | Maximum deadline clamp (seconds) |
+
+At `v_max = 15 m/s`: `deadline_min = 0.70s` → ~10.5 m reaction distance; `deadline_max = 3.50s` → ~52.5 m far-field horizon.
 
 ### Event Mix
 
@@ -87,12 +76,6 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 | `event_mix_enemy` | `float` | `0.33` | Probability of enemy-type events |
 | `event_mix_obstacle` | `float` | `0.33` | Probability of obstacle-type events |
 | `event_mix_lane` | `float` | `0.34` | Probability of lane-type events |
-
-### Arena Bounds
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `event_bounds_xy` | `tuple` | `(-100, 100, -50, 50)` | Event generation bounds: `(x_min, x_max, y_min, y_max)` |
 
 ### Topics
 
@@ -103,13 +86,14 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 
 ---
 
-## Physics (Non-Deterministic)
+## Physics
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `cmd_latency_s` | `float` | `0.10` | Command-to-actuation delay (FIFO buffer depth) |
 | `wind_level_0to1` | `float` | `0.5` | Wind intensity scaling factor (0 = no wind, 1 = maximum) |
-| `wind_accel_std_base_mps2` | `float` | `0.8` | Base standard deviation of wind acceleration (m/s^2) |
+| `wind_accel_std_base_mps2` | `float` | `0.8` | Base standard deviation of wind acceleration (m/s²) |
+| `physics_seed` | `int` | `42` | RNG seed for wind disturbance; same seed → identical gusts across strategies |
 
 ---
 
@@ -127,17 +111,14 @@ All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/c
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `results_csv_path` | `str` | `"logs/results/experiment_summary.csv"` | Path for the main experiment results CSV |
-| `analyzer_out_dir` | `str` | `"logs/results"` | Directory for analysis outputs (plots, summaries) |
+| `analyzer_out_dir` | `str` | `"logs/results"` | Directory for analysis outputs (summaries) |
 | `analyzer_strategies` | `list[str]` | `["APE1", "APE2", "APE3", "TROOP"]` | Strategy names to evaluate and compare |
-| `analyzer_pair_order` | `tuple[str, str] \| None` | `None` | Explicit pair ordering for pairwise analysis; auto-detected if `None` |
-| `analyzer_annotate_points` | `bool` | `False` | Whether to annotate individual data points on plots |
-| `analyzer_include_timeouts` | `bool` | `True` | Whether to include timed-out runs in analysis |
 
 ---
 
 ## Navigation (GoToConfig)
 
-These are defined in `nav_algorithm_T.py` as `GoToConfig`:
+Defined in `nav_algorithm_T.py` as `GoToConfig`:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

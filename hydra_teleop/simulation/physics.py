@@ -110,6 +110,8 @@ class DronePhysics:
         self._wind_level    = float(getattr(cfg, "wind_level_0to1", 0.5))
         self._wind_std_base = float(getattr(cfg, "wind_accel_std_base_mps2", 0.8))  # base accel noise scale
         self._wind_ax = self._wind_ay = self._wind_az = 0.0
+        self._wind_seed     = int(getattr(cfg, "physics_seed", 42))
+        self._rng           = random.Random(self._wind_seed)
 
         # Desired commands (latest)
         self._vx_cmd = self._vy_cmd = self._vz_cmd = self._wz_cmd = 0.0
@@ -152,7 +154,7 @@ class DronePhysics:
         tau   = max(self._wind_tau_s, 1e-3)
         decay = math.exp(-dt / tau)
         sigma = std * math.sqrt(max(0.0, 1.0 - math.exp(-2.0 * dt / tau)))
-        return decay * a_prev + sigma * random.gauss(0.0, 1.0)
+        return decay * a_prev + sigma * self._rng.gauss(0.0, 1.0)
 
     def _push_cmd(self, vx: float, vy: float, vz: float, wz: float, dt: float) -> None:
         self._cmd_buf.append((vx, vy, vz, wz))
@@ -250,6 +252,7 @@ class DronePhysics:
         self._wz = self._awz = 0.0
         self._vx_cmd = self._vy_cmd = self._vz_cmd = self._wz_cmd = 0.0
         self._wind_ax = self._wind_ay = self._wind_az = 0.0
+        self._rng.seed(self._wind_seed)
 
 
 # ----------------------------- Notes & Tuning -----------------------------

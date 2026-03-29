@@ -3,7 +3,6 @@ import logging
 import logging.handlers
 import queue
 import threading
-import time
 import atexit
 from pathlib import Path
 from typing import Optional
@@ -21,10 +20,10 @@ class AsyncLoggerCfg:
         drop_on_full: bool = True,
         console: bool = True,
         level: int = logging.INFO,
-        monitor_interval_s: Optional[float] = 5.0,  # None disables monitor
-        register_atexit: bool = True,               # auto-shutdown on process exit
-        ensure_dirs: bool = True,                   # create parent dirs for logfile
-        json_format: bool = True,                   # <-- now respected
+        monitor_interval_s: Optional[float] = None,  # unused, kept for API compatibility
+        register_atexit: bool = True,
+        ensure_dirs: bool = True,
+        json_format: bool = True,
     ):
         self.logfile = logfile
         self.max_bytes = max_bytes
@@ -33,7 +32,6 @@ class AsyncLoggerCfg:
         self.drop_on_full = drop_on_full
         self.console = console
         self.level = level
-        self.monitor_interval_s = monitor_interval_s
         self.register_atexit = register_atexit
         self.ensure_dirs = ensure_dirs
         self.json_format = json_format
@@ -138,30 +136,7 @@ class AsyncLoggerHandle:
         self.queue = queue_obj
         self.listener = listener
         self.handler = handler
-        self._monitor_thread = None
-        self._monitor_stop = threading.Event()
-        self._stopped = False  # <-- add
-
-    # -- Monitoring --
-    def start_monitor(self, interval_s: float):
-        if interval_s is None or interval_s <= 0:
-            return
-        def _monitor():
-            while not self._monitor_stop.wait(interval_s):
-                try:
-                    qsize = self.queue.qsize()
-                except Exception:
-                    qsize = -1
-                #print(f"[async-logger monitor] queue_size={qsize} dropped={self.handler.dropped}")
-        t = threading.Thread(target=_monitor, daemon=True, name="async-logger-monitor")
-        t.start()
-        self._monitor_thread = t
-
-    def stop_monitor(self):
-        if self._monitor_thread:
-            self._monitor_stop.set()
-            self._monitor_thread.join(timeout=2.0)
-            self._monitor_thread = None  # <-- add
+        self._stopped = False
 
     # -- Stats --
     def get_stats(self) -> dict:
@@ -173,12 +148,10 @@ class AsyncLoggerHandle:
 
     # -- Shutdown (idempotent) --
     def stop(self, timeout: float = 2.0):
-        """Stop monitor then stop listener (flushes remaining records). Safe if called multiple times."""
+        """Stop listener (flushes remaining records). Safe if called multiple times."""
         if self._stopped:
-            return  # <-- guard: already stopped
+            return
         self._stopped = True
-
-        self.stop_monitor()
 
         # If QueueListener was never started or already stopped, its _thread may be None.
         thread = getattr(self.listener, "_thread", None)
@@ -189,7 +162,7 @@ class AsyncLoggerHandle:
             # Python’s QueueListener.stop() joins the thread and sets _thread to None
             self.listener.stop()
         except Exception as e:
-            # Best effort, don't raise during shutdown
+            # Best effort, don’t raise during shutdown
             print("Warning: async logger listener.stop() failed:", e)
 
 def _ensure_parent_dirs(path_str: str) -> str:
@@ -255,9 +228,6 @@ def setup_async_logger(cfg: AsyncLoggerCfg) -> AsyncLoggerHandle:
         root.addHandler(qh)
 
     handle = AsyncLoggerHandle(q, listener, qh)
-
-    if cfg.monitor_interval_s:
-        handle.start_monitor(cfg.monitor_interval_s)
 
     if cfg.register_atexit:
         atexit.register(handle.stop)

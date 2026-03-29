@@ -12,7 +12,7 @@ Hydra is a multi-layer system that bridges three domains:
 2. **Middleware** -- ROS 2 Jazzy handles inter-process communication via topics
 3. **Application** -- Python modules implement navigation algorithms, event handling, energy modeling, and experiment orchestration
 
-All three layers run concurrently. The application layer drives the experiment loop, spawning and tearing down Gazebo instances for each strategy evaluation.
+All three layers run concurrently. The application layer drives the experiment loop, spawning one Gazebo instance per attempt and teleporting the drone back to start between strategy evaluations.
 
 ---
 
@@ -104,21 +104,21 @@ All three layers run concurrently. The application layer drives the experiment l
 For each attempt (until good_runs == simulation_runs):
 
   1. ArenaGenerator.run()           Generate NFZ layout + target position
-  2. For each strategy in [APE1, APE2, APE3, TROOP]:
-     a. emitter.reset()             Reset event sequence to same seed
-     b. viol_node.mark_run_start()  Reset violation counter
-     c. ener_node.mark_run_start()  Reset energy accumulator
-     d. start_sim(cfg)              Launch fresh Gazebo instance
+  2. start_sim(cfg)                 Launch one Gazebo instance for this attempt
+  3. For each strategy in [APE1, APE2, APE3, TROOP]:
+     a. reset_sim() (if not first)  Teleport drone back to start pose
+     b. emitter.reset()             Reset event sequence to same seed
+     c. viol_node.mark_run_start()  Reset violation counter
+     d. ener_node.mark_run_start()  Reset energy accumulator
      e. LidarTargetNavigatorTROOP() Create navigator for this strategy
      f. nav.go_to(timeout_s)        Execute navigation to target
      g. nav.shutdown()              Clean up navigator subscriptions
-     h. stop_sim()                  Kill Gazebo instance
-     i. Collect: reached, elapsed, energy, violations, events
-
-  3. If all strategies reached target:
+     h. Collect: reached, elapsed, energy, violations, events
+  4. stop_sim()                     Kill Gazebo instance
+  5. If all strategies reached target:
      - Write one CSV row per strategy
      - Increment good_runs
-  4. Else:
+  6. Else:
      - Discard attempt, continue to next
 ```
 
@@ -166,7 +166,7 @@ The TROOP (Time-Resource Optimized Operations Planner) navigator is the core int
             ┌────────┐   ┌────────┐   ┌────────┐
             │  APE3  │   │  APE2  │   │  APE1  │
             │  Full  │   │  Med   │   │  Fast  │
-            │ ~90 ms │   │ ~25 ms │   │ ~8 ms  │
+            │~2035ms │   │~1343ms │   │ ~523ms │
             └────┬───┘   └────┬───┘   └────┬───┘
                  │             │             │
                  └─────────────┼─────────────┘
@@ -184,6 +184,8 @@ The TROOP (Time-Resource Optimized Operations Planner) navigator is the core int
                     │   → Gazebo           │
                     └──────────────────────┘
 ```
+
+TROOP uses `ape3_select_threshold_ms=2589` (APE3 budget + 554ms safety margin), which shifts approximately 14% of events from APE3 to APE2 relative to the raw budget boundary. Solo APE1/APE2/APE3 strategies use the default thresholds from `EventDecisionCfg`.
 
 ### LiDAR Processing Pipeline
 
@@ -282,7 +284,7 @@ Hydra tracks two independent energy sources:
 P(t) = P_idle + (TDP - P_idle) * U_eff * (f / f_base)^alpha
 
 Where:
-  TDP        = 65 W (thermal design power)
+  TDP        = 25 W (Jetson Orin NX 16GB thermal design power)
   P_idle     = TDP * idle_frac (20%)
   U_eff      = effective CPU utilization
   f / f_base = frequency scaling ratio
@@ -307,7 +309,7 @@ Where:
 The `EventEmitter` generates events with deterministic timing:
 
 ```
-dt ~ LogUniform(event_dt_min_s, event_dt_max_s)
+dt ~ LogUniform(dt_min_s, dt_max_s)
 deadline = clamp(alpha * dt, [deadline_min_s, deadline_max_s])
 type ~ Categorical(enemy=0.33, obstacle=0.33, lane=0.34)
 ```

@@ -39,13 +39,13 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
   <!-- <img src="docs/screenshots/results_plot.png" width="48%" alt="Strategy comparison results"> -->
 </p>
 
-> **To add screenshots:** save images to `docs/screenshots/` and uncomment the lines above. See the HTML comments in this file for detailed instructions.
+> **To add screenshots:** save images to `docs/screenshots/` and uncomment the lines above.
 
 ---
 
 ## Highlights
 
-- **Deadline-Aware APE Selection** -- Dynamically selects between fast (8 ms), medium (25 ms), and full (90 ms) planning algorithms based on real-time event deadlines
+- **Deadline-Aware APE Selection** -- Dynamically selects between fast (~523 ms), medium (~1343 ms), and full (~2035 ms) planning algorithms based on real-time event deadlines
 - **TROOP Meta-Algorithm** -- Time-budget-aware selector that picks the best available planner within deadline constraints, maximizing planning quality without missing deadlines
 - **Procedural World Generation** -- City-grid and Perlin-noise arena generators create unique no-fly zone layouts for each run, ensuring statistical robustness
 - **Physics-Accurate Simulation** -- DJI FlyCart 30-tuned dynamics model with actuator latency, aerodynamic drag, jerk limiting, and Ornstein-Uhlenbeck wind gusts
@@ -87,7 +87,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
               │                                          │
               │   ┌──────┐  ┌──────┐  ┌──────┐          │
               │   │ APE1 │  │ APE2 │  │ APE3 │          │
-              │   │ 8 ms │  │ 25ms │  │ 90ms │          │
+              │   │ 523ms│  │1343ms│  │2035ms│          │
               │   │ Fast │  │ Med  │  │ Full │          │
               │   └──┬───┘  └──┬───┘  └──┬───┘          │
               │      └─────────┼─────────┘              │
@@ -217,11 +217,11 @@ python3 -m hydra_teleop.main
 
 ### Experiment Loop
 
-Each experiment consists of up to **1,000 successful runs**. For each run:
+Each experiment collects up to **1,000 successful runs**. For each attempt:
 
 1. **Arena Generation** -- A unique no-fly zone layout and target position are procedurally generated (city-grid or Perlin-noise style)
-2. **Strategy Evaluation** -- All four strategies (APE1, APE2, APE3, TROOP) navigate the same arena with identical event sequences
-3. **Validation** -- Only runs where all strategies reach the target are kept, ensuring fair head-to-head comparison
+2. **Strategy Evaluation** -- All four strategies (APE1, APE2, APE3, TROOP) navigate the same arena with identical event sequences, sharing one Gazebo instance (drone is teleported back to start between strategies)
+3. **Validation** -- Only attempts where all strategies reach the target are kept, ensuring fair head-to-head comparison
 4. **Recording** -- Results (elapsed time, energy, violations, event handling) are written to CSV
 
 ### Event-Driven Navigation
@@ -254,11 +254,14 @@ Results are saved to `logs/results/experiment_summary.csv` with the following me
 |---|---|
 | `elapse_time` | Time to reach target (seconds) |
 | `zone_violations` | Number of no-fly zone entries |
-| `compute_energy_kj` | CPU computational energy (kJ) |
-| `energy_kj` | Total motion energy (kJ) |
-| `mean_power_kw` | Average power consumption (kW) |
-| `events_handled` | Successfully resolved events |
-| `event_violated` | Missed deadline events |
+| `compute_latency_us` | CPU planning latency (microseconds) |
+| `compute_energy_j` | CPU computational energy (joules) |
+| `propulsion_energy_j` | Motion energy via EPM model (joules) |
+| `propulsion_mean_power_w` | Average propulsion power (watts) |
+| `events_handled` | Total events processed |
+| `event_violated` | Events where deadline was missed |
+| `event_violated_deadline` | Missed due to deadline expiry |
+| `event_violated_preemptive` | Missed due to preemption |
 | `event_violation_rate` | Fraction of events that missed deadline |
 
 The built-in `statistics_analyzer` produces aggregated summaries comparing all strategies.
@@ -273,8 +276,8 @@ All parameters are centralized in [`hydra_teleop/config.py`](hydra_teleop/config
 |---|---|---|
 | **Simulation** | `simulation_runs`, `simulation_timeout` | How many runs, per-run timeout |
 | **World Generation** | `simulation_world_style`, `target_distance` | City vs. Perlin, target placement |
-| **Dynamics** | `speed_x/y/z`, `yaw_rate`, `rate_hz` | Velocity limits, control frequency |
-| **Events** | `event_dt_min_s`, `deadline_alpha` | Event timing, deadline model |
+| **Dynamics** | `rate_hz`, `cmd_latency_s` | Control frequency, actuator delay |
+| **Events** | `deadline_alpha`, `deadline_min_s`, `deadline_max_s` | Deadline model parameters |
 | **Physics** | `cmd_latency_s`, `wind_level_0to1` | Actuator delay, wind intensity |
 | **Analysis** | `analyzer_strategies`, `results_csv_path` | Which strategies to compare |
 

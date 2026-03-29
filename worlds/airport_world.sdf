@@ -7,6 +7,13 @@
     <plugin filename="gz-sim-sensors-system"           name="gz::sim::systems::Sensors"/>
     <plugin filename="gz-sim-user-commands-system"     name="gz::sim::systems::UserCommands"/>
 
+    <!-- Physics: enforce 1× real-time -->
+    <physics name="default_physics" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
     <!-- Lighting / sky -->
     <light type="directional" name="sun">
       <cast_shadows>false</cast_shadows>

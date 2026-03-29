@@ -9,6 +9,9 @@ dist/
 build/
 .eggs/
 
+# APE SystemC build artifacts
+hydra_teleop/tools/ape_sim/build/
+
 # Generated simulation assets
 models/generated/
 
@@ -38,6 +41,9 @@ Meeting.md
 # Extracted data directories (experiment snapshots)
 city5001Filter/
 city851&1181/
+
+# Generated runtime data
+*.csv
 
 # Misc
 .bashrc

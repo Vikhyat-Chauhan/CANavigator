@@ -15,18 +15,17 @@ from ..simulation.physics import DronePhysics
 
 class GzTeleop:
     """
-    Realism-upgraded velocity teleop.
+    Velocity teleop with physics-based motion shaping.
 
-    SAME Public API:
+    Public API:
       - start()
       - set_cmd(vx, vy, vz, wz)
       - publish_once(linear, angular)
       - stop()
       - shutdown()
 
-    Implementation detail:
-      - All motion shaping (physics/env) is delegated to DronePhysics.
-      - This class only handles threading, logging, and publishing.
+    All motion shaping is delegated to DronePhysics.
+    This class handles threading, logging, and publishing.
     """
 
     def __init__(self, topic: str, cfg: TeleopConfig):
@@ -78,12 +77,7 @@ class GzTeleop:
 
     # -------------- public API --------------
     def start(self) -> None:
-        self._logger.info({
-                            "physics" : True
-                        },
-                        extra = {
-                            "event" : "Started"
-                        })  
+        self._logger.info({"physics": True}, extra={"event": "Started"})
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -101,26 +95,27 @@ class GzTeleop:
         angular: Tuple[float, float, float],
     ) -> None:
         # Direct one-shot publish (bypasses physics shaping)
-        self._logger.info({
-                            "vx" : linear[0],
-                            "vy" : linear[1],
-                            "vz" : linear[2],
-                            "wx" : angular[0],
-                            "wx" : angular[0],
-                            "wx" : angular[0],
-                        },
-                        extra = {
-                            "event" : "PUBLISH_ONCE"
-                        })  
+        self._logger.info(
+            {"vx": linear[0], "vy": linear[1], "vz": linear[2],
+             "wx": angular[0], "wy": angular[1], "wz": angular[2]},
+            extra={"event": "PUBLISH_ONCE"},
+        )
         try:
             self._pub.send(linear, angular)
         except Exception:
             pass
 
+    def pause(self) -> None:
+        """Stop the publish loop so Gazebo can safely shut down. Counterpart: start()."""
+        self.set_cmd(0.0, 0.0, 0.0, 0.0)
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._thread = None
+        self._physics.reset()
+
     def stop(self) -> None:
-        self._logger.info({
-                            "event" : "STOP"
-                        })
+        self._logger.info({"event": "STOP"})
         self.set_cmd(0.0, 0.0, 0.0, 0.0)
         self._physics.reset()
 

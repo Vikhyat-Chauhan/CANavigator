@@ -7,7 +7,7 @@
 # - Emits a single VIOLATIONSUMMARY only when log_and_reset() is called
 # - One-time LOADEDBOXES record at startup
 
-import json, os, threading, math, time
+import json, os
 from typing import List, Tuple, Optional, Dict, Any
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
@@ -23,19 +23,6 @@ def load_rects(meta_path: str) -> List[Tuple[float, float, float, float]]:
         meta = json.load(f)
     rects = meta.get("rectangles_xywh", [])
     return [tuple(map(float, r)) for r in rects]
-
-
-def _now_from_msg_or_clock(node: Node, msg: Optional[PoseStamped]) -> float:
-    """Seconds (float). Prefer msg.header.stamp; fallback to ROS clock; then time.time()."""
-    try:
-        if msg is not None and msg.header.stamp:
-            return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-    except Exception:
-        pass
-    try:
-        return node.get_clock().now().nanoseconds * 1e-9
-    except Exception:
-        return time.time()
 
 
 def point_in_rect(x: float, y: float, cx: float, cy: float, w: float, h: float) -> bool:
@@ -59,18 +46,11 @@ class ViolationMonitor(Node):
         self,
         pose_topic: str = "/model/drone1/pose/info",
         meta_path: str = META_PATH,
-        min_step_m: float = 1e-3,       # ignore tiny jitter steps
     ):
         super().__init__("violation_monitor")
 
-        # Python logger (uses your existing logging format/handlers)
         self._logger = logging.getLogger(__name__)
         self._lock = Lock()
-
-        # Keep parameters for compatibility (values are ignored by logic)
-        self.declare_parameter("min_step_m", float(min_step_m))
-
-        self._min_step = max(0.0, float(self.get_parameter("min_step_m").value))
 
         self._rects = load_rects(meta_path)
         n = len(self._rects)
@@ -85,10 +65,9 @@ class ViolationMonitor(Node):
         self._violations_per_rect: List[int] = [0] * n
 
         # Global state
-        self._prev_xy: Optional[Tuple[float, float]] = None
         self._total_violations: int = 0
         self._segment_label: str = "run"
-        self._segment_start_wall: float = time.time()
+        self._segment_start_wall: float = 0.0
         self._last_pose: Tuple[float, float] = (0.0, 0.0)
 
         # Subscribe
@@ -107,15 +86,8 @@ class ViolationMonitor(Node):
     # --------------------- Callbacks ----------------------
     def _on_pose(self, msg: PoseStamped):
         x, y = msg.pose.position.x, msg.pose.position.y
-        _ = _now_from_msg_or_clock(self, msg)  # time available if you want it later
 
         with self._lock:
-            # Motion debounce (optional; still updates state)
-            if self._prev_xy is not None:
-                if math.hypot(x - self._prev_xy[0], y - self._prev_xy[1]) < self._min_step:
-                    # Too small movement; still update last pose below.
-                    pass
-
             # Visit logic: count exactly once on ENTER per rectangle
             for i, (cx, cy, w, h) in enumerate(self._rects):
                 now_in = point_in_rect(x, y, cx, cy, w, h)
@@ -134,8 +106,6 @@ class ViolationMonitor(Node):
                     self._total_violations += 1
                     self._armed[i] = False
 
-            # Update last pose
-            self._prev_xy = (x, y)
             self._last_pose = (x, y)
 
     # --------------------- Public controls ----------------------
@@ -145,12 +115,12 @@ class ViolationMonitor(Node):
         """
         with self._lock:
             self._segment_label = label
-            self._segment_start_wall = time.time()
+            self._segment_start_wall = self.get_clock().now().nanoseconds * 1e-9
             self._total_violations = 0
             for i in range(len(self._violations_per_rect)):
                 self._violations_per_rect[i] = 0
 
-            # Clear visit state so a run boundary doesn't inherit a partial visit
+            # Clear visit state so a run boundary doesn't inherit a partial visit.
             n = len(self._rects)
             self._armed = [True] * n
             self._inside_prev = [False] * n
@@ -190,7 +160,7 @@ class ViolationMonitor(Node):
 
             # Reset for next run (same behavior as mark_run_start but keep label default)
             self._segment_label = "run"
-            self._segment_start_wall = time.time()
+            self._segment_start_wall = self.get_clock().now().nanoseconds * 1e-9
             self._total_violations = 0
             for i in range(len(self._violations_per_rect)):
                 self._violations_per_rect[i] = 0
@@ -204,26 +174,15 @@ class ViolationMonitor(Node):
 def start_violation_monitor(
     pose_topic: str = "/model/drone1/pose/info",
     meta_path: str = META_PATH,
-    min_step_m: float = 1e-3,
     callback_group=None,
 ):
     """
     Create (but DO NOT SPIN) the ViolationMonitor node.
-
-    Returns:
-        (node, None)  # thread is None to maintain backward compatibility
-
-    Notes:
-      - Add this node to your shared executor (MultiThreadedExecutor).
-      - Do not call rclpy.spin on this node anywhere else.
+    Add the returned node to a shared MultiThreadedExecutor; do not call rclpy.spin on it.
+    Returns (node, None) for backwards compatibility.
     """
-    node = ViolationMonitor(
-        pose_topic=pose_topic,
-        meta_path=meta_path,
-        min_step_m=min_step_m,
-    )
+    node = ViolationMonitor(pose_topic=pose_topic, meta_path=meta_path)
     if callback_group is not None:
-        # If the caller passes a callback group, assign it to the subscription
         try:
             node._sub.callback_group = callback_group  # type: ignore[attr-defined]
         except Exception:
@@ -235,17 +194,12 @@ def add_violation_monitor_to_executor(
     executor,
     pose_topic: str = "/model/drone1/pose/info",
     meta_path: str = META_PATH,
-    min_step_m: float = 1e-3,
     callback_group=None,
 ):
-    """
-    Convenience helper: construct the node and add it to the provided executor.
-    Returns the created node.
-    """
+    """Convenience helper: construct the node and add it to the provided executor."""
     node, _ = start_violation_monitor(
         pose_topic=pose_topic,
         meta_path=meta_path,
-        min_step_m=min_step_m,
         callback_group=callback_group,
     )
     executor.add_node(node)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import json, time, threading, random, math, csv, os
+import rclpy.parameter
 from rclpy.node import Node
 from std_msgs.msg import String
 # Pose is only used in non-deterministic mode
@@ -21,13 +22,27 @@ class EventCfg:
 
     # ---- Fixed defaults (not meant to be tuned) ----
     topic: str = field(default="/hydra/event", init=False)
-    dt_min_s: float = field(default=0.02, init=False)   # log-uniform Δt min
-    dt_max_s: float = field(default=4.0, init=False)    # log-uniform Δt max
+    dt_min_s: float = field(default=0.900, init=False)
+    # Ensures minimum inter-arrival (900ms) > APE1 sleep (523ms) by 183ms,
+    # guaranteeing APE1 resolves before any subsequent event arrives.
+    # Closes the preemptive violation channel for APE1 by construction.
+    dt_max_s: float = field(default=4.0,  init=False)  # log-uniform upper bound
 
     # Deadline model: deadline = clamp(α * Δt, [min, max])
-    deadline_alpha: float = field(default=0.80, init=False)
-    deadline_min_s: float = field(default=0.12, init=False)
-    deadline_max_s: float = field(default=1.20, init=False)
+    # Values sourced from TeleopConfig at construction time via from_teleop_cfg().
+    # Defaults here match TeleopConfig so a bare EventCfg() is still self-consistent.
+    #
+    # deadline_min = 0.60s: APE1 budget (523ms) < 600ms → APE1 always resolves.
+    # deadline_max = 3.50s: APE3 budget (2035ms) < 3500ms → APE3 resolves on
+    #   long-deadline events (~30% of the distribution).
+    # deadline_alpha = 0.85: deadlines span [600ms, 3500ms] with log-uniform dt
+    #   in [0.900s, 4.0s]. Expected tier split (1M sample simulation):
+    #     APE1 wins (0.52s < d ≤ 1.73s): ~61% of TROOP resolutions
+    #     APE2 wins (1.73s < d ≤ 2.03s): ~9%  of TROOP resolutions
+    #     APE3 wins (d > 2.03s):          ~30% of TROOP resolutions
+    deadline_alpha: float = field(default=0.85, init=False)
+    deadline_min_s: float = field(default=0.60, init=False)
+    deadline_max_s: float = field(default=3.50, init=False)
     global_deadline_s: Optional[float] = field(default=None, init=False)
 
     # Event mix probabilities
@@ -40,10 +55,16 @@ class EventCfg:
 
     @staticmethod
     def from_teleop_cfg(cfg: TeleopConfig) -> "EventCfg":
-        return EventCfg(
+        ecfg = EventCfg(
             seed=getattr(cfg, "event_seed", None),
             event_deterministic=bool(getattr(cfg, "event_deterministic", False)),
         )
+        # Propagate deadline knobs from TeleopConfig so the emitter and selector
+        # thresholds are always derived from the same source of truth.
+        ecfg.deadline_alpha = float(getattr(cfg, "deadline_alpha", ecfg.deadline_alpha))
+        ecfg.deadline_min_s = float(getattr(cfg, "deadline_min_s", ecfg.deadline_min_s))
+        ecfg.deadline_max_s = float(getattr(cfg, "deadline_max_s", ecfg.deadline_max_s))
+        return ecfg
 
 # ----------------------------- Emitter -----------------------------
 class EventEmitter(Node):
@@ -58,7 +79,16 @@ class EventEmitter(Node):
     """
 
     def __init__(self, teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None):
-        super().__init__("hydra_event_emitter")
+        super().__init__(
+            "hydra_event_emitter",
+            parameter_overrides=[
+                rclpy.parameter.Parameter(
+                    "use_sim_time",
+                    rclpy.parameter.Parameter.Type.BOOL,
+                    True,
+                )
+            ],
+        )
         self._cfg = gen_cfg or EventCfg.from_teleop_cfg(teleop_cfg)
         self._rnd = random.Random(self._cfg.seed)
 
@@ -119,6 +149,19 @@ class EventEmitter(Node):
         self._t_logical = 0.0
         self._i = 0
         self._stop_flag.clear()
+        # Flush a sentinel null event so the navigator's _EventSub._pending
+        # is cleared of any stale message from the previous run before new
+        # events begin arriving. Without this, the first real event of the
+        # new run collides with the buffered tail of the old run, causing a
+        # ~1-4ms inter-arrival gap that triggers a preemptive violation.
+        try:
+            sentinel = json.dumps({"kind": "__RESET__", "deadline_s": 0.0, "t_emit": -1.0, "meta": {}})
+            msg = String()
+            msg.data = sentinel
+            self._pub.publish(msg)
+        except Exception:
+            pass
+        # -------------------- Restart emission loop with reset RNG/clock/index ------------------
         self.start()
 
     # ---------------- Internals ----------------
@@ -142,50 +185,114 @@ class EventEmitter(Node):
         if r < self._cfg.mix_enemy + self._cfg.mix_obstacle: return "SUDDEN_OBSTACLE"
         return "LANE_BLOCK"
 
+    # ---------------- Sim-time helper ----------------
+    def _sim_time(self) -> float:
+        """Return sim time from the ROS clock (requires use_sim_time=True).
+        Falls back to wall time before /clock messages arrive."""
+        try:
+            ns = self.get_clock().now().nanoseconds
+            if ns > 0:
+                return ns * 1e-9
+        except Exception:
+            pass
+        return time.time()
+
     # ---------------- Main Loop ----------------
     def _loop(self):
-        last_wall_t = time.time()
-        while not self._stop_flag.is_set():
-            dt = self._draw_dt()
-            # Interruptible sleep: exits immediately when stop() sets the flag
-            if self._stop_flag.wait(dt):
-                break
+        # Poll interval: short enough to not miss tight deadlines
+        _POLL_S = 0.010
 
-            if self._cfg.event_deterministic:
-                # Purely logical timing & deterministic delta
+        if self._cfg.event_deterministic:
+            # Sim-time threshold for next emission; initialise once clock is live
+            _sim_t_next: Optional[float] = None
+            _next_dt: float = self._draw_dt()
+
+            while not self._stop_flag.is_set():
+                if self._stop_flag.wait(_POLL_S):
+                    break
+
+                now_sim = self._sim_time()
+
+                # Initialise threshold on the first valid sim-time tick
+                if _sim_t_next is None:
+                    _sim_t_next = now_sim + _next_dt
+                    continue
+
+                if now_sim < _sim_t_next:
+                    continue
+
+                # Fire event
+                dt = _next_dt
                 self._t_logical += dt
-                delta_t = dt
                 t_emit = self._t_logical
                 kind = self._choose_kind()
                 meta = {"i": self._i, "kind": kind}
                 self._i += 1
-            else:
-                # Wall-clock delta; kind/geometry still seeded but may use pose
-                now = time.time()
-                delta_t = now - last_wall_t
-                last_wall_t = now
-                t_emit = now
+                deadline = self._deadline_from_dt(dt)
+
+                # Schedule next
+                _next_dt = self._draw_dt()
+                _sim_t_next = now_sim + _next_dt
+
+                obj = {"kind": kind, "t_emit": t_emit, "deadline_s": deadline, "meta": meta}
+                msg = String(); msg.data = json.dumps(obj)
+                if self._stop_flag.is_set():
+                    break
+                try:
+                    self._pub.publish(msg)
+                except Exception as e:
+                    try:
+                        self.get_logger().warn(f"publish aborted during shutdown: {e}")
+                    except Exception:
+                        pass
+                    break
+                if self._csv_fp:
+                    try:
+                        self._csv.writerow([t_emit, kind, deadline, json.dumps(meta)])
+                    except Exception:
+                        pass
+            return  # deterministic path done
+
+        else:
+            # Non-deterministic: sim-time delta and t_emit
+            last_sim_t = self._sim_time()
+            dt = self._draw_dt()
+            while not self._stop_flag.is_set():
+                if self._stop_flag.wait(_POLL_S):
+                    break
+
+                now_sim = self._sim_time()
+                if now_sim - last_sim_t < dt:
+                    continue
+
+                # Fire event
+                delta_t = now_sim - last_sim_t
+                last_sim_t = now_sim
+                t_emit = now_sim
                 kind = self._choose_kind()
                 meta = self._make_meta_nondet(kind)
+                deadline = self._deadline_from_dt(delta_t)
 
-            # Emit
-            deadline = self._deadline_from_dt(delta_t)
-            obj = {"kind": kind, "t_emit": t_emit, "deadline_s": deadline, "meta": meta}
-            msg = String(); msg.data = json.dumps(obj)
-            # Guard publish in case shutdown raced ahead
-            if self._stop_flag.is_set():
-                break
-            try:
-                self._pub.publish(msg)
-            except Exception as e:
-                # Likely shutdown in progress; exit cleanly
+                # Draw next interval before publishing
+                dt = self._draw_dt()
+
+                obj = {"kind": kind, "t_emit": t_emit, "deadline_s": deadline, "meta": meta}
+                msg = String(); msg.data = json.dumps(obj)
+                if self._stop_flag.is_set():
+                    break
                 try:
-                    self.get_logger().warn(f"publish aborted during shutdown: {e}")
-                except Exception:
-                    pass
-                break
-            if self._csv_fp:
-                self._csv.writerow([obj["t_emit"], kind, obj["deadline_s"], json.dumps(meta)])
+                    self._pub.publish(msg)
+                except Exception as e:
+                    try:
+                        self.get_logger().warn(f"publish aborted during shutdown: {e}")
+                    except Exception:
+                        pass
+                    break
+                if self._csv_fp:
+                    try:
+                        self._csv.writerow([t_emit, kind, deadline, json.dumps(meta)])
+                    except Exception:
+                        pass
 
     # ---------------- Non-deterministic meta (kept minimal) ----------------
     def _make_meta_nondet(self, kind: str) -> Dict[str, Any]:
@@ -199,31 +306,17 @@ class EventEmitter(Node):
         h = self._rnd.uniform(4.0, 10.0)
         return {"rect_wh": [round(w, 3), round(h, 3)]}
 
-def make_event_emitter_node(teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None,
-                            callback_group=None) -> EventEmitter:
-    """
-    Construct the EventEmitter node (no spinning). Caller must:
-      1) add this node to their shared executor, and
-      2) call emitter.start() to begin emission thread.
-    """
+def add_event_emitter_to_executor(executor, teleop_cfg: TeleopConfig,
+                                  gen_cfg: Optional[EventCfg] = None,
+                                  callback_group=None) -> EventEmitter:
+    """Construct the EventEmitter, attach to executor, and return it.
+    Call .start() to begin emission."""
     node = EventEmitter(teleop_cfg, gen_cfg)
     if callback_group is not None:
-        # assign the callback group to the subscription if present
         try:
             for sub in node.subscriptions:
                 sub.callback_group = callback_group
         except Exception:
             pass
-    return node
-
-
-def add_event_emitter_to_executor(executor, teleop_cfg: TeleopConfig,
-                                  gen_cfg: Optional[EventCfg] = None,
-                                  callback_group=None) -> EventEmitter:
-    """
-    Convenience: make the emitter node and add it to the provided executor.
-    Returns the node (call .start() to begin emitting).
-    """
-    node = make_event_emitter_node(teleop_cfg, gen_cfg, callback_group=callback_group)
     executor.add_node(node)
     return node

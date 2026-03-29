@@ -7,40 +7,30 @@ Hydra experiment runner:
 - Runs each navigator (APE1, APE2, APE3, TROOP) in a fresh sim
 - Records results to CSV and (optionally) runs the analyzer
 
-All public APIs are preserved.
-
-NEW BEHAVIOR:
-- We keep running until we have cfg.simulation_runs "good runs"
-  where *all* strategies have reached == True.
-- For each world/attempt, as soon as any strategy fails (reached == False),
-  we immediately abort the remaining strategies for that attempt and discard it.
-
-NEW CSV BEHAVIOR:
-- For each "good run", we write one row per strategy to cfg.results_csv_path.
-- Each row includes a run_id (1..cfg.simulation_runs) plus the buffered fields.
+Runs until cfg.simulation_runs "good runs" are collected (all strategies
+reached == True). Any attempt where a strategy fails is discarded immediately.
+For each good run, one row per strategy is written to cfg.results_csv_path
+with a run_id (1..cfg.simulation_runs) plus the buffered fields.
 """
-
-from __future__ import annotations
 
 import os
 import csv
-import math
 import logging
 import threading
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 
 import rclpy
 
 from .config import TeleopConfig
-from .simulation.sim import start_sim, stop_sim
+from .simulation.sim import start_sim, stop_sim, reset_sim
 from .navigation.teleop import GzTeleop
 from .simulation.pose_republisher import add_pose_republisher_to_executor
 from .tools.bridge import start_parameter_bridge
-from .tools.violations import add_violation_monitor_to_executor, start_violation_monitor
-from .tools.energy_monitor import add_energy_monitor_to_executor, start_energy_monitor
+from .tools.violations import add_violation_monitor_to_executor
+from .tools.energy_monitor import add_energy_monitor_to_executor
 from .tools.event_emitter import add_event_emitter_to_executor, EventCfg
 from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
-from .analysis.log_transformer import run_from_cfg
+from .tools.rtf_monitor import RtfMonitor
 from .analysis.statistics_analyzer import run_analysis
 from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
 from rclpy.executors import MultiThreadedExecutor
@@ -52,38 +42,47 @@ def _run_one_strategy(
     ctrl: GzTeleop,
     cfg: TeleopConfig,
     exec: MultiThreadedExecutor,
-) -> Tuple[bool, float, float, int, int]:
+) -> Tuple[bool, float, float, float, int, int, int, int]:
     """
-    Start a fresh sim, run a navigator to target (with timeout), collect results.
-    Ensures sim/nav clean shutdown even on exceptions.
+    Run a navigator to target (with timeout) inside an already-running sim.
+    Sim lifetime is managed by the caller — this function only manages the navigator.
 
     Returns:
-      (reached: bool, elapsed_s: float, energy_j: float, events_handled: int, events_violated: int)
+      (reached: bool, elapsed_s: float, latency_us: float,
+       compute_energy_j: float, events_handled: int, events_violated: int,
+       events_violated_deadline: int, events_violated_preemptive: int)
     """
-    sim = None
     nav = None
     try:
-        sim = start_sim(cfg)
-        nav = LidarTargetNavigatorTROOP(ctrl, cfg, strategy_name)
+        nav = LidarTargetNavigatorTROOP(ctrl, cfg, strategy_name,
+                                        # For TROOP, APE3 is selected only when deadline >= 2589ms.
+                                        # This is intentionally above the raw APE3 budget (2035ms)
+                                        # to add a 554ms safety margin, shifting ~14% of events from
+                                        # APE3 to APE2 (empirical tier split: APE1≈61%, APE2≈23%,
+                                        # APE3≈16%). Solo APE1/2/3 strategies use default thresholds
+                                        # (None → EventDecisionCfg defaults).
+                                        ape3_select_threshold_ms=2589 if strategy_name == "TROOP" else None)
         nav.attach_to_executor(exec)
-        reached, elapsed, energy, events_handled, events_violated = nav.go_to(
+        reached, elapsed, latency_us, compute_energy_j, events_handled, \
+            events_violated, events_violated_deadline, events_violated_preemptive = nav.go_to(
             timeout_s=cfg.simulation_timeout
         )
-        return reached, elapsed, energy, events_handled, events_violated
+        return reached, elapsed, latency_us, compute_energy_j, events_handled, \
+            events_violated, events_violated_deadline, events_violated_preemptive
     finally:
-        # Try to shut down navigator even if construction failed mid-way
         try:
             if nav is not None:
                 nav.shutdown()
         except Exception as e:
             print(f"[hydra][WARN] {strategy_name} nav.shutdown() error: {e}")
 
-        # Stop simulation even if start failed later
+        # Stop the publish loop before any potential Gazebo reset/teardown.
+        # Without this, the gz-transport publisher and the plugin destructor race to
+        # free the same Twist message → double free / SIGABRT.
         try:
-            if sim is not None:
-                stop_sim(sim)
+            ctrl.pause()
         except Exception as e:
-            print(f"[hydra][WARN] stop_sim error for {strategy_name}: {e}")
+            print(f"[hydra][WARN] ctrl.pause() error: {e}")
 
 
 def main() -> None:
@@ -102,20 +101,11 @@ def main() -> None:
     logger = logging.getLogger("hydra_teleop.main")
     print(f"\n=== [LOGGING INITIALIZED] ===")
 
-    # --- Bridges (pose + ROS↔GZ) ---
     pose_node = None
-    rosgz_bridge = None  # kept for symmetry if you add other bridges later
-
-    # --- Event emitter ---
+    rosgz_bridge = None
     emitter = None
-
-    # --- Velocity publisher ---
     ctrl = None
-
-    # --- Generators (single instances; re-run each loop) ---
     arena_gen = None
-
-    # --- Violation & energy monitor (single instance; reset per run) ---
     viol_node = None
     ener_node = None
 
@@ -127,17 +117,20 @@ def main() -> None:
         # -----------------------------
         # CSV setup (one file per cfg)
         # -----------------------------
-        results_csv_path = cfg.results_csv_path  # <- make sure this exists in TeleopConfig
+        results_csv_path = cfg.results_csv_path
         csv_fieldnames = [
             "run",
             "strategy",
             "elapse_time",
             "zone_violations",
-            "compute_energy_kj",
-            "energy_kj",
-            "mean_power_kw",
+            "compute_latency_us",
+            "compute_energy_j",
+            "propulsion_energy_j",   # EPM×distance (Kirschstein model)
+            "propulsion_mean_power_w",
             "events_handled",
             "event_violated",
+            "event_violated_deadline",
+            "event_violated_preemptive",
             "event_violation_rate",
         ]
 
@@ -266,83 +259,101 @@ def main() -> None:
                 all_reached = True
                 buffered_records: List[Dict[str, Any]] = []
 
-                # Strategies (APE1/APE2/APE3/TROOP) — each run uses same event seed
-                for strategy in cfg.analyzer_strategies:
-                    print(f"\n=== Hydra Experiment Strategy {strategy} ===")
+                # Boot Gazebo once per attempt — all strategies reuse the same instance.
+                # Between strategies we teleport the drone back to start via gz service
+                # instead of restarting, saving ~(N_strategies - 1) × 10s per attempt.
+                sim = None
+                rtf_mon = None
+                try:
+                    sim = start_sim(cfg)
+                    rtf_mon = RtfMonitor(world_name="airport", interval_s=5.0)
+                    rtf_mon.start()
 
-                    emitter.reset()
-                    viol_node.mark_run_start(label=strategy)
-                    ener_node.mark_run_start(label=strategy)
+                    # Strategies (APE1/APE2/APE3/TROOP) — each run uses same event seed
+                    for strategy_idx, strategy in enumerate(cfg.analyzer_strategies):
+                        print(f"\n=== Hydra Experiment Strategy {strategy} ===")
 
-                    reached, elapsed, energy, events_handled, events_violated = _run_one_strategy(
-                        strategy, ctrl, cfg, exec
-                    )
+                        # Teleport drone back to start before every strategy except the first
+                        # (first strategy starts from the freshly booted Gazebo initial pose)
+                        if strategy_idx > 0:
+                            reset_sim(sim, cfg)
 
-                    violation_summary = viol_node.log_and_reset(
-                        label=strategy, include_boxes=True
-                    )
-                    energy_summary = ener_node.log_and_reset(
-                        label=strategy, include_params=True
-                    )
+                        emitter.reset()
+                        viol_node.mark_run_start(label=strategy)
+                        ener_node.mark_run_start(label=strategy)
 
-                    # This logger.info remains for JSON log/debugging
-                    logger.info(
-                        {
-                            "reached": reached,
-                            "elapsed": elapsed,
-                            "violations": violation_summary.get("total_violations"),
-                            "compute_energy_j": energy / 1000.0,
-                            "energy_j": energy_summary.get("energy_j"),
-                            "mean_power_w": energy_summary.get("mean_power_w"),
-                            "events_handled": events_handled,
-                            "events_violated": events_violated,
-                        },
-                        extra={"strategy": strategy},
-                    )
-
-                    buffered_records.append(
-                        {
-                            "strategy": strategy,
-                            "reached": reached,
-                            "elapsed": elapsed,
-                            "violations": violation_summary.get(
-                                "total_violations"
-                            ),
-                            "compute_energy_j": energy / 1000.0,
-                            "energy_j": energy_summary.get("energy_j"),
-                            "mean_power_w": energy_summary.get("mean_power_w"),
-                            "events_handled": events_handled,
-                            "events_violated": events_violated,
-                        }
-                    )
-
-                    if not reached:
-                        all_reached = False
-                        print(
-                            f"❌ Attempt {attempt_idx}, strategy {strategy} failed "
-                            f"(reached == False). Aborting remaining strategies "
-                            f"for this attempt."
+                        reached, elapsed, latency_us, compute_energy_j, events_handled, \
+                            events_violated, events_violated_deadline, events_violated_preemptive = _run_one_strategy(
+                            strategy, ctrl, cfg, exec
                         )
-                        # EARLY EXIT: don't waste time running remaining strategies
-                        break
+
+                        violation_summary = viol_node.log_and_reset(
+                            label=strategy, include_boxes=True
+                        )
+                        energy_summary = ener_node.log_and_reset(label=strategy)
+
+                        logger.info(
+                            {
+                                "reached": reached,
+                                "elapsed": elapsed,
+                                "violations": violation_summary.get("total_violations"),
+                                "compute_latency_us": latency_us,
+                                "compute_energy_j": compute_energy_j,
+                                "energy_j": energy_summary.get("energy_j"),
+                                "mean_power_w": energy_summary.get("mean_power_w"),
+                                "events_handled": events_handled,
+                                "events_violated": events_violated,
+                                "events_violated_deadline": events_violated_deadline,
+                                "events_violated_preemptive": events_violated_preemptive,
+                            },
+                            extra={"strategy": strategy},
+                        )
+
+                        buffered_records.append(
+                            {
+                                "strategy": strategy,
+                                "reached": reached,
+                                "elapsed": elapsed,
+                                "violations": violation_summary.get(
+                                    "total_violations"
+                                ),
+                                "compute_latency_us": latency_us,
+                                "compute_energy_j": compute_energy_j,
+                                "energy_j": energy_summary.get("energy_j"),
+                                "mean_power_w": energy_summary.get("mean_power_w"),
+                                "events_handled": events_handled,
+                                "events_violated": events_violated,
+                                "events_violated_deadline": events_violated_deadline,
+                                "events_violated_preemptive": events_violated_preemptive,
+                            }
+                        )
+
+                        if not reached:
+                            all_reached = False
+                            print(
+                                f"❌ Attempt {attempt_idx}, strategy {strategy} failed "
+                                f"(reached == False). Aborting remaining strategies "
+                                f"for this attempt."
+                            )
+                            # EARLY EXIT: don't waste time running remaining strategies
+                            break
+
+                finally:
+                    try:
+                        if rtf_mon is not None:
+                            rtf_mon.stop()
+                    except Exception as e:
+                        print(f"[hydra][WARN] rtf_mon.stop() error: {e}")
+                    try:
+                        stop_sim(sim)
+                    except Exception as e:
+                        print(f"[hydra][WARN] stop_sim error for attempt {attempt_idx}: {e}")
 
                 # --------- Post-strategy logic: success check + APE ordering ----------
                 if all_reached:
-                    # ------------------------------------------------------
-                    # Additional filter: require elapsed ordering
-                    #   APE1 > APE2 > APE3  (strictly slower → faster)
-                    # If this pattern is not satisfied, discard the attempt.
-                    # ------------------------------------------------------
-                    elapsed_by_strategy = {
-                        rec["strategy"]: rec["elapsed"] for rec in buffered_records
-                    }
-
-                    # If we reach here, all strategies reached AND ordering is OK
                     good_runs += 1
-                    run_idx = good_runs  # keep run index aligned with kept runs
                     print(
                         f"✅ Run {run_idx}: all strategies reached target "
-                        f"and satisfied APE1>APE2>APE3 ordering "
                         f"({good_runs}/{cfg.simulation_runs} good runs)"
                     )
 
@@ -356,16 +367,20 @@ def main() -> None:
                                 {
                                     "run": run_idx,
                                     "strategy": rec["strategy"],
-                                    "elapse_time": rec["elapsed"],
+                                    "elapse_time": round(rec["elapsed"], 2),
                                     "zone_violations": rec["violations"],
-                                    "compute_energy_kj": rec["compute_energy_j"],
-                                    "energy_kj": rec["energy_j"],
-                                    "mean_power_kw": rec["mean_power_w"],
+                                    "compute_latency_us": round(rec["compute_latency_us"], 2),
+                                    "compute_energy_j": round(rec["compute_energy_j"], 2),
+                                    "propulsion_energy_j": round(rec["energy_j"], 2),
+                                    "propulsion_mean_power_w": round(rec["mean_power_w"], 2),
                                     "events_handled": rec["events_handled"],
                                     "event_violated": rec["events_violated"],
-                                    "event_violation_rate": (
+                                    "event_violated_deadline": rec["events_violated_deadline"],
+                                    "event_violated_preemptive": rec["events_violated_preemptive"],
+                                    "event_violation_rate": round(
                                         rec["events_violated"] / rec["events_handled"]
-                                        if rec["events_handled"] else 0.0
+                                        if rec["events_handled"] else 0.0,
+                                        2,
                                     ),
                                 }
                             )
@@ -436,11 +451,7 @@ def main() -> None:
         print(f"\n=== Simulations are 0, running in analysis mode only ===")
 
     # Post-processing: transform logs and run analyzer
-    #run_from_cfg()
-    result = run_analysis(zone_metric="mean")
-    #print(" Zone Metric:", result["zone_metric"])
-    #print(" Summary Csv:", result["summary_csv"])
-    #print(" Summary:", result["summary"])
+    run_analysis(zone_metric="mean")
 
 
 if __name__ == "__main__":

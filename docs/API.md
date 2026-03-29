@@ -47,7 +47,7 @@ Orchestrates the full experiment lifecycle:
 
 ### `_run_one_strategy(strategy_name, ctrl, cfg, exec) -> tuple`
 
-Runs a single navigation strategy in a fresh Gazebo instance.
+Runs a single navigation strategy within the currently running Gazebo instance.
 
 **Parameters:**
 - `strategy_name` (`str`): One of `"APE1"`, `"APE2"`, `"APE3"`, `"TROOP"`
@@ -55,7 +55,7 @@ Runs a single navigation strategy in a fresh Gazebo instance.
 - `cfg` (`TeleopConfig`): Configuration
 - `exec` (`MultiThreadedExecutor`): ROS 2 executor
 
-**Returns:** `(reached: bool, elapsed_s: float, energy_j: float, events_handled: int, events_violated: int)`
+**Returns:** `(reached: bool, elapsed_s: float, latency_us: float, compute_energy_j: float, events_handled: int, events_violated: int, events_violated_deadline: int, events_violated_preemptive: int)`
 
 ---
 
@@ -79,19 +79,25 @@ The primary navigation engine implementing deadline-aware APE selection with LiD
 
 **Constructor:**
 ```python
-LidarTargetNavigatorTROOP(ctrl: GzTeleop, cfg: TeleopConfig, strategy: str)
+LidarTargetNavigatorTROOP(
+    ctrl: GzTeleop,
+    cfg: TeleopConfig,
+    strategy: str,
+    ape3_select_threshold_ms: int | None = None,
+)
 ```
 
 - `ctrl`: Velocity controller for sending commands
 - `cfg`: Global configuration
 - `strategy`: Which planning mode to use (`"APE1"`, `"APE2"`, `"APE3"`, or `"TROOP"`)
+- `ape3_select_threshold_ms`: Override for the APE3 selection threshold; `None` uses `EventDecisionCfg` defaults. TROOP uses `2589` (APE3 budget + 554ms safety margin).
 
 **Methods:**
 
 | Method | Signature | Description |
 |---|---|---|
 | `attach_to_executor` | `(exec: MultiThreadedExecutor) -> None` | Register ROS 2 subscriptions with the executor |
-| `go_to` | `(target_xyz=None, timeout_s=None) -> tuple` | Navigate to target; returns `(reached, elapsed_s, energy_j, events_handled, events_violated)` |
+| `go_to` | `(target_xyz=None, timeout_s=None) -> tuple` | Navigate to target; returns `(reached, elapsed_s, latency_us, compute_energy_j, events_handled, events_violated, events_violated_deadline, events_violated_preemptive)` |
 | `shutdown` | `() -> None` | Clean up all subscriptions and internal state |
 
 #### `class GoToConfig`
@@ -110,13 +116,24 @@ Visited-space tracking parameters (dataclass).
 
 Safety subsystem parameters (dataclass).
 
+#### `class EventDecisionCfg`
+
+APE timing thresholds (dataclass).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ape1_budget_ms` | `int` | `523` | APE1 compute budget (ms) |
+| `ape2_budget_ms` | `int` | `1343` | APE2 compute budget (ms) |
+| `ape2_select_threshold_ms` | `int` | `1393` | APE2 budget + 50ms safety margin |
+| `ape3_budget_ms` | `int` | `2035` | APE3 compute budget (ms) |
+
 ---
 
 ### teleop.py
 
 #### `class GzTeleop`
 
-Thread-safe velocity controller that wraps `DronePhysics` and publishes shaped commands.
+Velocity teleop with physics-based motion shaping.
 
 **Constructor:**
 ```python
@@ -128,10 +145,11 @@ GzTeleop(topic: str, cfg: TeleopConfig)
 | Method | Signature | Description |
 |---|---|---|
 | `start` | `() -> None` | Begin the velocity publishing loop |
-| `set_cmd` | `(vx, vy, vz, wz) -> None` | Set desired velocity (thread-safe) |
-| `publish_once` | `(vx, vy, vz, wz) -> None` | Send a single velocity command |
-| `stop` | `() -> None` | Stop the publishing loop |
-| `shutdown` | `() -> None` | Full cleanup including transport |
+| `set_cmd` | `(vx, vy, vz, wz) -> None` | Set desired velocity setpoint (thread-safe) |
+| `publish_once` | `(linear: tuple, angular: tuple) -> None` | Send a single one-shot command (bypasses physics shaping) |
+| `pause` | `() -> None` | Stop publish loop and zero velocity; counterpart to `start()` |
+| `stop` | `() -> None` | Zero velocity setpoint and reset physics state |
+| `shutdown` | `(join_timeout=0.3) -> None` | Full cleanup: zero command, final publish, stop loop |
 
 ---
 
@@ -150,8 +168,7 @@ GzVelPub(topic: str = "/model/drone1/cmd_vel")
 
 | Method | Signature | Description |
 |---|---|---|
-| `publish` | `(vx, vy, vz, wz) -> None` | Publish a velocity command via Gazebo transport |
-| `close` | `() -> None` | Release transport resources |
+| `send` | `(linear: tuple, angular: tuple) -> None` | Publish a Twist message via Gazebo transport |
 
 ---
 
@@ -168,6 +185,10 @@ Launch a Gazebo simulation instance with the configured world and environment.
 #### `stop_sim(proc: subprocess.Popen) -> None`
 
 Gracefully terminate a Gazebo instance, falling back to SIGKILL if needed.
+
+#### `reset_sim(proc: subprocess.Popen, cfg: TeleopConfig) -> None`
+
+Teleport the drone back to its start pose via `gz service` without restarting Gazebo.
 
 #### `kill_process_tree(pid: int) -> None`
 
@@ -195,12 +216,12 @@ DronePhysics(cfg: TeleopConfig)
 | `reset` | `() -> None` | Zero all internal states and buffers |
 
 **Physics Pipeline:**
-1. Command latency (FIFO buffer)
+1. Command latency (FIFO buffer, depth = `cmd_latency_s`)
 2. 2nd-order actuator dynamics (per-axis)
 3. Jerk limiting (acceleration slew-rate)
 4. Tilt/thrust caps (lateral acceleration, asymmetric vertical)
 5. Aerodynamic drag (linear + quadratic)
-6. Wind gusts (Ornstein-Uhlenbeck process)
+6. Wind gusts (Ornstein-Uhlenbeck process, seeded by `physics_seed`)
 
 ---
 
@@ -288,7 +309,7 @@ Default EPM: **208.9 J/m** (DJI FlyCart 30 baseline).
 | Method | Signature | Description |
 |---|---|---|
 | `mark_run_start` | `(label: str) -> None` | Reset accumulator for a new strategy run |
-| `log_and_reset` | `(label: str, include_params: bool) -> dict` | Return energy summary and reset |
+| `log_and_reset` | `(label: str, include_params: bool) -> dict` | Return energy summary (`energy_j`, `mean_power_w`) and reset |
 
 #### `add_energy_monitor_to_executor(exec, pose_topic, callback_group) -> EnergyMonitor`
 
@@ -338,12 +359,14 @@ Generates Perlin-noise based no-fly zone layouts. Same interface as the city gen
 
 ### bridge.py
 
-#### `start_parameter_bridge(mappings: list[tuple]) -> subprocess.Popen`
+#### `start_parameter_bridge(mappings: list[tuple]) -> RosGzBridge`
 
 Start the `ros_gz_bridge parameter_bridge` process with the given topic mappings.
 
 **Parameters:**
 - `mappings`: List of `(topic, ros_type, gz_type)` tuples
+
+**Returns:** A `RosGzBridge` handle with a `.stop()` method.
 
 **Example:**
 ```python
@@ -351,6 +374,8 @@ bridge = start_parameter_bridge([
     ("/model/drone1/front_lidar/scan", "sensor_msgs/msg/LaserScan", "gz.msgs.LaserScan"),
     ("/model/drone1/cmd_vel", "geometry_msgs/msg/Twist", "gz.msgs.Twist"),
 ])
+# later:
+bridge.stop()
 ```
 
 ---
@@ -371,12 +396,12 @@ Configuration for the async logging system.
 | `drop_on_full` | `bool` | `False` | Drop messages when queue is full vs. block |
 | `console` | `bool` | `False` | Also print to stdout |
 | `level` | `int` | `logging.INFO` | Minimum log level |
-| `monitor_interval_s` | `float` | `10.0` | Queue health monitoring interval |
+| `monitor_interval_s` | `float \| None` | `None` | Unused; accepted for API compatibility |
 | `json_format` | `bool` | `True` | Use JSON formatting for log entries |
 
 #### `setup_async_logger(cfg: AsyncLoggerCfg) -> LogHandle`
 
-Initialize the async logging system. Returns a handle with a `.stop()` method.
+Initialize the async logging system. Returns a handle with a `.stop()` method that flushes and closes the logger.
 
 ---
 
@@ -386,19 +411,21 @@ Initialize the async logging system. Returns a handle with a `.stop()` method.
 
 #### `run_analysis(zone_metric: str = "mean") -> dict`
 
-Run statistical analysis on the experiment CSV results.
+Run statistical analysis on the experiment CSV results. Reads `cfg.results_csv_path`; writes summary CSV to `cfg.analyzer_out_dir`.
 
 **Parameters:**
-- `zone_metric`: Aggregation method for zone violations (`"mean"`, `"median"`, etc.)
+- `zone_metric`: Aggregation method for zone violations (`"mean"` or `"median"`)
 
 **Returns:** Dictionary with keys:
-- `zone_metric`: The computed zone metric value
+- `zone_metric`: The zone metric used
 - `summary_csv`: Path to the generated summary CSV
-- `summary`: Aggregated statistics dictionary
+- `summary`: Aggregated statistics dictionary keyed by strategy name
 
 ---
 
 ### log_transformer.py
+
+Standalone utility for converting JSON log files to CSV format. Not called by the main experiment loop.
 
 #### `run_from_cfg() -> None`
 

@@ -43,21 +43,10 @@ class EnergyMonitor(Node):
         self,
         pose_topic: str = DEFAULT_POSE_TOPIC,
         *,
-        # Kept for API compatibility; not used in energy computation:
-        mass_kg: float = 65.0,
-        n_rotors: int = 8,
-        rotor_diameter_m: float = 0.8,
-        rho_air: float = 1.225,
-        eta_elec: float = 0.7,
-        cdA_m2: float = 0.60,
-        k_induced: float = 1.15,
-        k_profile: float = 0.12,
-
         # Numerics / smoothing
         min_step_m: float = 0.01,
         v_tau_s: float = 0.25,
         vz_tau_s: float = 0.25,
-        log_every_s: float = 0.25,  # kept for API compat; unused in quiet mode
 
         # Paper model
         epm_preset: Optional[str] = "flykart30",
@@ -66,11 +55,6 @@ class EnergyMonitor(Node):
         super().__init__("energy_monitor")
         self._log = logging.getLogger(__name__)
         self._lock = Lock()
-
-        # Store (unused in math but retained for logging/API stability)
-        self.m = float(mass_kg); self.n = int(n_rotors); self.D = float(rotor_diameter_m)
-        self.rho = float(rho_air); self.eta = float(eta_elec); self.cdA = float(cdA_m2)
-        self.k_i = float(k_induced); self.k_prof = float(k_profile)
 
         self._min_step = max(0.0, float(min_step_m))
         self._v_tau = max(1e-3, float(v_tau_s))
@@ -92,7 +76,7 @@ class EnergyMonitor(Node):
 
         self._energy_j: float = 0.0
         self._elapsed_s: float = 0.0
-        self._segment_start_t_wall: float = time.time()
+        self._segment_start_t_wall: float = 0.0
         self._segment_label: str = "run"
 
         self._last_pos = (0.0, 0.0, 0.0)
@@ -109,8 +93,6 @@ class EnergyMonitor(Node):
                 "epm_j_per_m": round(self.Epm, 1),
                 "epm_preset": self._epm_preset,
                 "mode": "paper_only_epm(log on demand)",
-                # retained for compatibility/traceability:
-                "mass_kg": self.m, "n_rotors": self.n, "rotor_diameter_m": self.D,
             },
             extra={"type": "LOADEDPARAMS"},
         )
@@ -168,9 +150,13 @@ class EnergyMonitor(Node):
             self._segment_label = label
             self._energy_j = 0.0
             self._elapsed_s = 0.0
-            self._segment_start_t_wall = time.time()
+            self._segment_start_t_wall = self.get_clock().now().nanoseconds * 1e-9
+            # Reset pose tracking so a drone teleport between strategies doesn't
+            # produce a false energy spike on the first pose message of the new run.
+            self._prev_xyz = None
+            self._prev_t = None
 
-    def log_and_reset(self, label: Optional[str] = None, include_params: bool = False):
+    def log_and_reset(self, label: Optional[str] = None):
         with self._lock:
             lbl = label if label is not None else self._segment_label
             elapsed = max(0.0, self._elapsed_s)
@@ -195,47 +181,26 @@ class EnergyMonitor(Node):
                     "epm_preset": self._epm_preset,
                 },
             }
-            if include_params:
-                summary["params"] = {
-                    "mass_kg": self.m, "n_rotors": self.n, "rotor_diameter_m": self.D,
-                    "rho_air": self.rho, "eta_elec": self.eta, "cdA_m2": self.cdA,
-                    "k_induced": self.k_i, "k_profile": self.k_prof,
-                }
-
             self._log.info(summary, extra={"type": "ENERGYSUMMARY"})
 
             self._energy_j = 0.0
             self._elapsed_s = 0.0
-            self._segment_start_t_wall = time.time()
+            self._segment_start_t_wall = self.get_clock().now().nanoseconds * 1e-9
             self._segment_label = "run"
             return summary
 
 def start_energy_monitor(
     pose_topic: str = DEFAULT_POSE_TOPIC,
-    mass_kg: float = 65.0,
-    n_rotors: int = 8,
-    rotor_diameter_m: float = 0.8,
-    rho_air: float = 1.225,
-    eta_elec: float = 0.7,
-    cdA_m2: float = 0.60,
-    k_induced: float = 1.15,
-    k_profile: float = 0.12,
     min_step_m: float = 0.01,
     v_tau_s: float = 0.25,
     vz_tau_s: float = 0.25,
-    log_every_s: float = 0.25,
-
     epm_preset: Optional[str] = "flykart30",
     epm_j_per_m: Optional[float] = None,
     callback_group=None,
 ):
     node = EnergyMonitor(
         pose_topic=pose_topic,
-        mass_kg=mass_kg, n_rotors=n_rotors, rotor_diameter_m=rotor_diameter_m,
-        rho_air=rho_air, eta_elec=eta_elec, cdA_m2=cdA_m2,
-        k_induced=k_induced, k_profile=k_profile,
         min_step_m=min_step_m, v_tau_s=v_tau_s, vz_tau_s=vz_tau_s,
-        log_every_s=log_every_s,
         epm_preset=epm_preset, epm_j_per_m=epm_j_per_m,
     )
     if callback_group is not None:
