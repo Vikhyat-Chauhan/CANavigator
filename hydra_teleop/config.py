@@ -5,7 +5,7 @@ import os
 @dataclass
 class TeleopConfig:
     # --- Run Options ---
-    simulation_runs = 1000
+    simulation_runs = 100
     simulation_timeout = 200
     simulation_world_style = "city" #"perlin|city"
     # --- Sim / world ---
@@ -30,8 +30,6 @@ class TeleopConfig:
         if self.sim_env is None:
             self.sim_env = {
                 **os.environ,
-                "QT_QPA_PLATFORM": "xcb",
-                "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
                 "__EGL_VENDOR_LIBRARY_FILENAMES": "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
             }
 

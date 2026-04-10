@@ -33,7 +33,7 @@ def start_sim(cfg: TeleopConfig) -> subprocess.Popen | None:
     Launch Gazebo and return the Popen handle immediately (non-blocking).
     If cfg.launch_sim is False, returns None.
     """
-    sim_cmd = [*cfg.sim_cmd, cfg.world_path, "--render-engine", "ogre2"]
+    sim_cmd = [*cfg.sim_cmd, cfg.world_path, "--render-engine", "ogre2", "--headless-rendering"]
     sim = launch(sim_cmd, env=cfg.sim_env)
     if cfg.sim_boot_secs and cfg.sim_boot_secs > 0:
         time.sleep(cfg.sim_boot_secs)   # give Gazebo time to load

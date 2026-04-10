@@ -230,7 +230,7 @@ def main() -> None:
                 arena_gen = ArenaGenerator(
                     cfg,
                     ArenaGenCfg(
-                        seed= cfg.world_gen_seed_offset + (0 if cfg.fixed_seed else attempt_idx),
+                        seed= cfg.world_gen_seed_offset + (0 if cfg.fixed_seed else ((attempt_idx - 1) % 100) + 1),
                         target_min_dist=cfg.target_distance,
                         pass_through=True,
                         visual_alpha=0.0,
