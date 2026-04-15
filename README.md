@@ -31,7 +31,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
 -->
 
 <p align="center">
-  <!-- <img src="docs/screenshots/gazebo_city.png" width="48%" alt="City-grid arena in Gazebo"> -->
+  <img src="docs/screenshots/ezgif-22770adea7e2d06c.gif" width="48%" alt="Simulation">
   <!-- <img src="docs/screenshots/gazebo_perlin.png" width="48%" alt="Perlin-noise arena in Gazebo"> -->
 </p>
 <p align="center">
@@ -39,7 +39,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
   <!-- <img src="docs/screenshots/results_plot.png" width="48%" alt="Strategy comparison results"> -->
 </p>
 
-> **To add screenshots:** save images to `docs/screenshots/` and uncomment the lines above.
+<!-- **To add screenshots:** save images to `docs/screenshots/` and uncomment the lines above. -->
 
 ---
 
