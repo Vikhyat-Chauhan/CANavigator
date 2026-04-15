@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/tools/hydra_gen_merged.py
+# ca_navigator/tools/ca_nav_gen_merged.py
 #
 # City-style NFZ generator only:
 # - Roads carved as free space (major/minor grid)
@@ -7,7 +7,7 @@
 # Deterministic via a single master seed (also drives target placement with offset).
 #
 # Public usage:
-#   from hydra_teleop.tools import hydra_gen_merged as merged
+#   from ca_navigator.tools import ca_nav_gen_merged as merged
 #   paths = merged.run(seed=101, outdir="models/generated",
 #                      city_major_m=60.0, city_minor_m=30.0,
 #                      road_w_m=6.0, lot_w_m=14.0, lot_h_m=12.0,
@@ -423,7 +423,7 @@ class ArenaGenerator:
 def run(teleop_cfg=None, **kwargs) -> Dict[str, str]:
     """
     Convenience:
-      from hydra_teleop.tools import hydra_gen_merged as merged
+      from ca_navigator.tools import ca_nav_gen_merged as merged
       merged.run(self.teleop_cfg, seed=101, outdir="models/generated",
                  city_major_m=60.0, city_minor_m=30.0, road_w_m=6.0,
                  lot_w_m=14.0, lot_h_m=12.0, lot_setback_m=1.5,

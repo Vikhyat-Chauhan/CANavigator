@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/teleop.py
+# ca_navigator/teleop.py
 from __future__ import annotations
 
 import time

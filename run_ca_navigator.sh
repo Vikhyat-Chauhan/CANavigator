@@ -116,9 +116,9 @@ fi
 ./kill_ros.sh
 
 echo "==> 6) Running controller module"
-RUNS=10
+RUNS=1
 for i in $(seq 1 "$RUNS"); do
   echo "==> [Run $i/$RUNS]"
-  python3 -m "hydra_teleop.main" "$@"
+  python3 -m "ca_navigator.main" "$@"
   ./kill_ros.sh
 done

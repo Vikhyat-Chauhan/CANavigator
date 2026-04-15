@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/physics.py
+# ca_navigator/physics.py
 # FlyCart 30–tuned motion/actuator + environment shim for teleop velocity shaping.
 #
 # === References (overview) ===

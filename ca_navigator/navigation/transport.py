@@ -15,7 +15,7 @@ for base in ("gz.msgs10", "gz.msgs", "ignition.msgs"):
     try:
         Twist = __import__(f"{base}.twist_pb2", fromlist=["Twist"]).Twist
         Vector3d = __import__(f"{base}.vector3d_pb2", fromlist=["Vector3d"]).Vector3d
-        print(f"[hydra] Using msgs from: {base}")
+        print(f"[can] Using msgs from: {base}")
         break
     except Exception as e:
         _errors.append((base, str(e)))
@@ -49,7 +49,7 @@ class GzVelPub:
             if not self._pub:
                 raise RuntimeError("node.advertise returned None")
             self._publish_fn = lambda msg: self._pub.publish(msg)  # type: ignore[union-attr]
-            print("[hydra] Transport API: node.advertise(...).publish(msg)")
+            print("[can] Transport API: node.advertise(...).publish(msg)")
         except Exception:
             # Fallback legacy: Node.Advertise + Node.Publish
             ok = False
@@ -60,7 +60,7 @@ class GzVelPub:
             if not ok:
                 raise RuntimeError(f"Failed to advertise publisher on '{self.topic}' via any API.")
             self._publish_fn = lambda msg: self.node.Publish(self.topic, msg)  # type: ignore[attr-defined]
-            print("[hydra] Transport API: Node.Advertise(...), Node.Publish(topic, msg)")
+            print("[can] Transport API: Node.Advertise(...), Node.Publish(topic, msg)")
 
         self._msg = Twist()
 

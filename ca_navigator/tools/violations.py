@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/violations.py
+# ca_navigator/violations.py
 # Simple NFZ visit-based violations (QUIET mode):
 # - Loads axis-aligned rectangles (cx, cy, w, h) from generated_nofly_meta.json
 # - Counts exactly one ZONEVIOLATION per visit (i.e., on first ENTER after being outside)

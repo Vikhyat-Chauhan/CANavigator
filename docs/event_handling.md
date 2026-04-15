@@ -1,7 +1,7 @@
 # Event Handling in the Conflict Architecture (CA)
 
 This document describes the event episode lifecycle, violation taxonomy, selector
-calibration, commitment hold rationale, and CSV output schema for the Hydra teleop
+calibration, commitment hold rationale, and CSV output schema for the CANavigator teleop
 CA framework after the Option B fix (explicit execution commitment window).
 
 ---
@@ -36,7 +36,7 @@ event is returned:
 
 ### 1.3 Parallel APE launch
 
-In TROOP mode all three planner threads start immediately.  In solo modes (APE1,
+In CA mode all three planner threads start immediately.  In solo modes (APE1,
 APE2, APE3) only one thread starts.  Each thread writes its result into
 `_evt_proposals` under a lock when it finishes (~1 ms for APE1, ~16 ms for APE3).
 
@@ -230,7 +230,7 @@ Each row in `results_csv_path` corresponds to one strategy in one good run
 | Column       | Type  | Description |
 |--------------|-------|-------------|
 | `run`        | int   | 1-based index of the good run (discarded attempts not counted) |
-| `strategy`   | str   | Navigator name: APE1, APE2, APE3, or TROOP |
+| `strategy`   | str   | Navigator name: APE1, APE2, APE3, or CA |
 | `elapse_time`| float | Wall-clock seconds from nav start to target reached |
 
 ### NFZ columns

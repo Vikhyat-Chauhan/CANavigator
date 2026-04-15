@@ -6,11 +6,11 @@
   <img src="https://img.shields.io/badge/Platform-Ubuntu_22.04+-purple?logo=ubuntu&logoColor=white" alt="Ubuntu 22.04+">
 </p>
 
-# Hydra
+# CANavigator
 
 **Heterogeneous, Yet Dynamic Resource Allocation for Autonomous Drones**
 
-A high-fidelity drone navigation and benchmarking framework that evaluates **deadline-aware adaptive planning** under dynamic, event-driven constraints. Hydra orchestrates thousands of reproducible simulation runs comparing multiple planning strategies (APE1/APE2/APE3/TROOP) in procedurally generated environments with real-time no-fly zones, LiDAR-based obstacle avoidance, and physics-accurate energy modeling.
+A high-fidelity drone navigation and benchmarking framework that evaluates **deadline-aware adaptive planning** under dynamic, event-driven constraints. CANavigator orchestrates thousands of reproducible simulation runs comparing multiple planning strategies (APE1/APE2/APE3/CA) in procedurally generated environments with real-time no-fly zones, LiDAR-based obstacle avoidance, and physics-accurate energy modeling.
 
 ---
 
@@ -46,7 +46,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
 ## Highlights
 
 - **Deadline-Aware APE Selection** -- Dynamically selects between fast (~523 ms), medium (~1343 ms), and full (~2035 ms) planning algorithms based on real-time event deadlines
-- **TROOP Meta-Algorithm** -- Time-budget-aware selector that picks the best available planner within deadline constraints, maximizing planning quality without missing deadlines
+- **CA Meta-Algorithm** -- Time-budget-aware selector that picks the best available planner within deadline constraints, maximizing planning quality without missing deadlines
 - **Procedural World Generation** -- City-grid and Perlin-noise arena generators create unique no-fly zone layouts for each run, ensuring statistical robustness
 - **Physics-Accurate Simulation** -- DJI FlyCart 30-tuned dynamics model with actuator latency, aerodynamic drag, jerk limiting, and Ornstein-Uhlenbeck wind gusts
 - **Full ROS 2 + Gazebo Integration** -- LiDAR perception, velocity control, and pose tracking through standard ROS 2 topics bridged to Gazebo
@@ -83,7 +83,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
                   └──────────────────┬─────────────────┘
                                      ▼
               ┌──────────────────────────────────────────┐
-              │        TROOP Navigator Engine            │
+              │        CA Navigator Engine            │
               │                                          │
               │   ┌──────┐  ┌──────┐  ┌──────┐          │
               │   │ APE1 │  │ APE2 │  │ APE3 │          │
@@ -109,7 +109,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
 
 ### APE Deadline Selection
 
-The TROOP meta-algorithm selects planners based on time remaining before an event deadline:
+The CA meta-algorithm selects planners based on time remaining before an event deadline:
 
 ```
 Time Left (t_left)          Selected Planner
@@ -124,12 +124,12 @@ t_left  ≤ t_hard            APE1 (fast dodge, emergency)
 ## Project Structure
 
 ```
-hydra/
-├── hydra_teleop/                    # Core Python package
+ca_navigator/
+├── ca_navigator/                    # Core Python package
 │   ├── main.py                      # Experiment orchestrator & CSV recorder
 │   ├── config.py                    # TeleopConfig — all tunables in one place
 │   ├── navigation/
-│   │   ├── nav_algorithm_T.py       # TROOP navigator + APE1/APE2/APE3 engines
+│   │   ├── nav_algorithm_T.py       # CA navigator + APE1/APE2/APE3 engines
 │   │   ├── teleop.py               # GzTeleop velocity controller
 │   │   └── transport.py            # Gazebo transport publisher
 │   ├── simulation/
@@ -154,7 +154,7 @@ hydra/
 │   └── x3-uav/                     # X3 UAV drone model (SDF)
 ├── worlds/
 │   └── airport_world.sdf           # Gazebo simulation world
-├── run_hydra.sh                    # Full setup & execution script
+├── run_ca_navigator.sh                    # Full setup & execution script
 ├── quick_run.sh                    # Fast re-run (skips setup)
 ├── kill_ros.sh                     # ROS 2 / Gazebo cleanup utility
 ├── requirements.txt                # Python dependencies
@@ -182,11 +182,11 @@ hydra/
 
 ```bash
 # Clone the repository
-git clone https://github.com/vikhyat/Hydra.git
-cd Hydra
+git clone https://github.com/vikhyat/CANavigator.git
+cd CANavigator
 
 # Run the automated setup (installs dependencies, creates venv, runs experiment)
-./run_hydra.sh
+./run_ca_navigator.sh
 ```
 
 The setup script will:
@@ -208,7 +208,7 @@ The setup script will:
 ```bash
 source venv/bin/activate
 export PYTHONPATH="/usr/lib/python3/dist-packages:${PYTHONPATH:-}"
-python3 -m hydra_teleop.main
+python3 -m ca_navigator.main
 ```
 
 ---
@@ -220,7 +220,7 @@ python3 -m hydra_teleop.main
 Each experiment collects up to **1,000 successful runs**. For each attempt:
 
 1. **Arena Generation** -- A unique no-fly zone layout and target position are procedurally generated (city-grid or Perlin-noise style)
-2. **Strategy Evaluation** -- All four strategies (APE1, APE2, APE3, TROOP) navigate the same arena with identical event sequences, sharing one Gazebo instance (drone is teleported back to start between strategies)
+2. **Strategy Evaluation** -- All four strategies (APE1, APE2, APE3, CA) navigate the same arena with identical event sequences, sharing one Gazebo instance (drone is teleported back to start between strategies)
 3. **Validation** -- Only attempts where all strategies reach the target are kept, ensuring fair head-to-head comparison
 4. **Recording** -- Results (elapsed time, energy, violations, event handling) are written to CSV
 
@@ -270,7 +270,7 @@ The built-in `statistics_analyzer` produces aggregated summaries comparing all s
 
 ## Configuration
 
-All parameters are centralized in [`hydra_teleop/config.py`](hydra_teleop/config.py) via the `TeleopConfig` dataclass. Key groups:
+All parameters are centralized in [`ca_navigator/config.py`](ca_navigator/config.py) via the `TeleopConfig` dataclass. Key groups:
 
 | Category | Examples | Description |
 |---|---|---|
@@ -301,7 +301,7 @@ See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for a full parameter refere
 |---|---|
 | **Simulation** | Gazebo Harmonic (SDF 1.9), X3 UAV model |
 | **Middleware** | ROS 2 Jazzy, `ros_gz_bridge` |
-| **Navigation** | Custom TROOP + APE1/APE2/APE3 planners |
+| **Navigation** | Custom CA + APE1/APE2/APE3 planners |
 | **Perception** | 2D LiDAR (front-mounted), pose tracking |
 | **Physics** | Custom FlyCart 30 dynamics (Python) |
 | **Analysis** | NumPy, pandas, CSV/JSON logging |

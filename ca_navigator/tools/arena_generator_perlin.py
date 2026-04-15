@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/tools/hydra_gen_merged.py
+# ca_navigator/tools/ca_nav_gen_merged.py
 #
 # Call from main just like your existing plugin: ctor + run().
 # Also exports a top-level run(...) shortcut.
@@ -316,7 +316,7 @@ class ArenaGenerator:
 def run(teleop_cfg=None, **kwargs) -> Dict[str, str]:
     """
     Example:
-      from hydra_teleop.tools import hydra_gen_merged as merged
+      from ca_navigator.tools import ca_nav_gen_merged as merged
       merged.run(self.teleop_cfg, seed=42, density=0.25, corr_len_m=12, outdir="models/generated")
     """
     return ArenaGenerator(teleop_cfg, ArenaGenCfg(**kwargs)).run()

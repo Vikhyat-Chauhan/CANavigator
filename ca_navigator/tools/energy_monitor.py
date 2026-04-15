@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/energy_monitor.py
+# ca_navigator/energy_monitor.py
 # Paper-only energy model: E = EPM[J/m] * horizontal_distance[m]
 # Quiet during flight; emits a single ENERGYSUMMARY on log_and_reset()
 

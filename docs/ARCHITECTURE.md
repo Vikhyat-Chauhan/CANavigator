@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes the system design, data flow, and component interactions within Hydra.
+This document describes the system design, data flow, and component interactions within CANavigator.
 
 ---
 
 ## System Overview
 
-Hydra is a multi-layer system that bridges three domains:
+CANavigator is a multi-layer system that bridges three domains:
 
 1. **Simulation** -- Gazebo Harmonic provides 6-DOF physics, LiDAR sensor simulation, and 3D rendering
 2. **Middleware** -- ROS 2 Jazzy handles inter-process communication via topics
@@ -33,7 +33,7 @@ All three layers run concurrently. The application layer drives the experiment l
 │          │          │          │          │          │              │
 │          ▼          ▼          ▼          ▼          ▼              │
 │  ┌───────────┐ ┌─────────┐ ┌────────┐ ┌────────┐ ┌──────────┐    │
-│  │ Arena     │ │ Event   │ │ TROOP  │ │ Viol.  │ │ Energy   │    │
+│  │ Arena     │ │ Event   │ │ CA     │ │ Viol.  │ │ Energy   │    │
 │  │ Generator │ │ Emitter │ │ Nav.   │ │ Monitor│ │ Monitor  │    │
 │  └───────────┘ └─────────┘ └────────┘ └────────┘ └──────────┘    │
 │                                                                     │
@@ -58,7 +58,7 @@ All three layers run concurrently. The application layer drives the experiment l
 │    /model/drone1/front_lidar/scan (LaserScan)  Gazebo → Navigator  │
 │    /model/drone1/pose/info       (PoseStamped) Gazebo → Monitors   │
 │    /model/target_sphere/pose/info (PoseStamped) Gazebo → Navigator │
-│    /hydra/event                  (String/JSON)  Emitter → Navigator │
+│    /ca_navigator/event                  (String/JSON)  Emitter → Navigator │
 │                                                                     │
 │  Bridges:                                                           │
 │    ros_gz_bridge parameter_bridge (LiDAR + cmd_vel)                │
@@ -105,12 +105,12 @@ For each attempt (until good_runs == simulation_runs):
 
   1. ArenaGenerator.run()           Generate NFZ layout + target position
   2. start_sim(cfg)                 Launch one Gazebo instance for this attempt
-  3. For each strategy in [APE1, APE2, APE3, TROOP]:
+  3. For each strategy in [APE1, APE2, APE3, CA]:
      a. reset_sim() (if not first)  Teleport drone back to start pose
      b. emitter.reset()             Reset event sequence to same seed
      c. viol_node.mark_run_start()  Reset violation counter
      d. ener_node.mark_run_start()  Reset energy accumulator
-     e. LidarTargetNavigatorTROOP() Create navigator for this strategy
+     e. LidarTargetNavigatorCA() Create navigator for this strategy
      f. nav.go_to(timeout_s)        Execute navigation to target
      g. nav.shutdown()              Clean up navigator subscriptions
      h. Collect: reached, elapsed, energy, violations, events
@@ -139,14 +139,14 @@ For each attempt (until good_runs == simulation_runs):
 
 ## Navigation Architecture
 
-### TROOP Meta-Algorithm
+### CA Meta-Algorithm
 
-The TROOP (Time-Resource Optimized Operations Planner) navigator is the core intelligence of Hydra. It wraps three Adaptive Planning Engines (APEs) with a deadline-aware selector.
+The CA (Time-Resource Optimized Operations Planner) navigator is the core intelligence of CANavigator. It wraps three Adaptive Planning Engines (APEs) with a deadline-aware selector.
 
 ```
                     ┌──────────────────────┐
                     │    Event Queue       │
-                    │  (from /hydra/event) │
+                    │  (from /ca_navigator/event) │
                     └──────────┬───────────┘
                                │
                                ▼
@@ -185,7 +185,7 @@ The TROOP (Time-Resource Optimized Operations Planner) navigator is the core int
                     └──────────────────────┘
 ```
 
-TROOP uses `ape3_select_threshold_ms=2589` (APE3 budget + 554ms safety margin), which shifts approximately 14% of events from APE3 to APE2 relative to the raw budget boundary. Solo APE1/APE2/APE3 strategies use the default thresholds from `EventDecisionCfg`.
+CA uses `ape3_select_threshold_ms=2589` (APE3 budget + 554ms safety margin), which shifts approximately 14% of events from APE3 to APE2 relative to the raw budget boundary. Solo APE1/APE2/APE3 strategies use the default thresholds from `EventDecisionCfg`.
 
 ### LiDAR Processing Pipeline
 
@@ -276,7 +276,7 @@ Desired Velocity (vx, vy, vz, wz)
 
 ## Energy Model
 
-Hydra tracks two independent energy sources:
+CANavigator tracks two independent energy sources:
 
 ### CPU Energy (Computational)
 
@@ -314,7 +314,7 @@ deadline = clamp(alpha * dt, [deadline_min_s, deadline_max_s])
 type ~ Categorical(enemy=0.33, obstacle=0.33, lane=0.34)
 ```
 
-Each event is published as a JSON string on `/hydra/event` containing:
+Each event is published as a JSON string on `/ca_navigator/event` containing:
 - Event type (enemy / obstacle / lane)
 - Timestamp
 - Deadline
@@ -367,7 +367,7 @@ All ROS 2 subscriptions use `ReentrantCallbackGroup` to allow concurrent executi
 | LiDAR scans | Gazebo | Navigator | ros_gz_bridge → ROS 2 topic |
 | Drone pose | Gazebo | Navigator, Monitors | PoseRepublisher → ROS 2 topic |
 | Target pose | Gazebo | Navigator | PoseRepublisher → ROS 2 topic |
-| Events | EventEmitter | Navigator | ROS 2 /hydra/event topic |
+| Events | EventEmitter | Navigator | ROS 2 /ca_navigator/event topic |
 | NFZ metadata | ArenaGenerator | ViolationMonitor | JSON file on disk |
 | Results | Navigator | main.py | Return values |
 | CSV output | main.py | Disk | csv.DictWriter |

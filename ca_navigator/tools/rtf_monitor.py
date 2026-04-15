@@ -53,6 +53,6 @@ class RtfMonitor:
     def _run(self) -> None:
         while not self._stop.is_set():
             rtf = self._fetch_rtf()
-            if rtf is not None:
-                print(f"[RTF] {rtf:.3f}")
+            #if rtf is not None:
+            #    print(f"[RTF] {rtf:.3f}")
             self._stop.wait(self._interval)

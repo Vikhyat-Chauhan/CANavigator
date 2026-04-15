@@ -1,6 +1,6 @@
 # Configuration Reference
 
-All configuration is centralized in [`hydra_teleop/config.py`](../hydra_teleop/config.py) via the `TeleopConfig` dataclass. This document lists every parameter with its default value, type, and description.
+All configuration is centralized in [`ca_navigator/config.py`](../ca_navigator/config.py) via the `TeleopConfig` dataclass. This document lists every parameter with its default value, type, and description.
 
 ---
 
@@ -81,7 +81,7 @@ At `v_max = 15 m/s`: `deadline_min = 0.70s` → ~10.5 m reaction distance; `dead
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `event_topic` | `str` | `"/hydra/event"` | ROS 2 topic for publishing event JSON payloads |
+| `event_topic` | `str` | `"/ca_navigator/event"` | ROS 2 topic for publishing event JSON payloads |
 | `ros_pose_topic` | `str` | `"/model/drone1/pose/info"` | ROS 2 topic for drone pose (used by event emitter) |
 
 ---
@@ -112,7 +112,7 @@ At `v_max = 15 m/s`: `deadline_min = 0.70s` → ~10.5 m reaction distance; `dead
 |---|---|---|---|
 | `results_csv_path` | `str` | `"logs/results/experiment_summary.csv"` | Path for the main experiment results CSV |
 | `analyzer_out_dir` | `str` | `"logs/results"` | Directory for analysis outputs (summaries) |
-| `analyzer_strategies` | `list[str]` | `["APE1", "APE2", "APE3", "TROOP"]` | Strategy names to evaluate and compare |
+| `analyzer_strategies` | `list[str]` | `["APE1", "APE2", "APE3", "CA"]` | Strategy names to evaluate and compare |
 
 ---
 

@@ -1,4 +1,4 @@
-# hydra_teleop/analysis/statistics_analyzer.py
+# ca_navigator/analysis/statistics_analyzer.py
 from __future__ import annotations
 import os, re
 import numpy as np
@@ -23,7 +23,7 @@ def run_analysis(zone_metric: str = "mean") -> Dict[str, Any]:
         raise ValueError("zone_metric must be 'median' or 'mean'")
 
     # --- Strict dependency on TeleopConfig ---
-    from hydra_teleop.config import TeleopConfig
+    from ca_navigator.config import TeleopConfig
     cfg = TeleopConfig()
 
     if not (isinstance(getattr(cfg, "results_csv_path", None), str) and cfg.results_csv_path):

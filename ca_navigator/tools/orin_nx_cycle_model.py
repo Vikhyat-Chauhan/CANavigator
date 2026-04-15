@@ -267,7 +267,7 @@ class OrinNxCycleMeter:
 
       Solo modes (APE1/APE2/APE3): one APE runs, cost = that APE's full latency.
 
-      TROOP parallel-halt costs (Orin NX, 2.25× Zen 4):
+      CA parallel-halt costs (Orin NX, 2.25× Zen 4):
         APE1 selected → min(523,523) + min(1729,523) + min(2034,523) ≈ 1569 µs
         APE2 selected → min(523,1729) + min(1729,1729) + min(2034,1729) ≈ 3981 µs
         APE3 selected → min(523,2034) + min(1729,2034) + min(2034,2034) ≈ 4286 µs
@@ -292,7 +292,7 @@ class OrinNxCycleMeter:
 
         selected : APE whose plan was applied ("APE1", "APE2", or "APE3")
         running  : all APEs spawned for this event — ["APE1","APE2","APE3"]
-                   for TROOP, [selected] for solo modes
+                   for CA, [selected] for solo modes
         """
         t_sel = _PER_INVOCATION_US.get(selected, 0.0)
         cost  = sum(min(_PER_INVOCATION_US.get(n, 0.0), t_sel) for n in running)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hydra Tool Plugin: Target (sphere) generator (simple, keeps TeleopConfig dependency)
+CANavigator Tool Plugin: Target (sphere) generator (simple, keeps TeleopConfig dependency)
 - Picks a safe (x,y) that avoids restricted rectangles (from nofly meta)
 - Keeps a minimum distance from the drone start (from TeleopConfig or explicit cfg)
 - Writes an SDF for a static sphere + a small meta JSON
@@ -146,7 +146,7 @@ class TargetGenerator:
         top    = y_max - wall_margin
         if left > right or bottom > top:
             raise RuntimeError(
-                f"[hydra.tools] Sample bounds invalid after margins; "
+                f"[can.tools] Sample bounds invalid after margins; "
                 f"reduce margin_walls or radius."
             )
 
@@ -186,7 +186,7 @@ class TargetGenerator:
             xg += step
 
         raise RuntimeError(
-            "[hydra.tools] Could not place target: no collision-free position "
+            "[can.tools] Could not place target: no collision-free position "
             "satisfies rectangles, radius/margins, and min_dist_start."
         )
 

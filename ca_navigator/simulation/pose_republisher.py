@@ -13,7 +13,7 @@ I tried several methods to get drone positions when the simulation is running :
     a ros bridge from which I can later fetch this information, I am guessing it might not be very efficient but this is the only option i have now.
 """
 #!/usr/bin/env python3
-# hydra_teleop/pose_republisher.py
+# ca_navigator/pose_republisher.py
 import json, subprocess, threading
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Union, List

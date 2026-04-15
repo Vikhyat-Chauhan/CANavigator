@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Log transformer for the *new* Hydra schema (STRICT TeleopConfig version).
+Log transformer for the *new* CANavigator schema (STRICT TeleopConfig version).
 
-- Detects run boundaries as: collect EVENTS up to hydra_teleop.teleop STOP,
-  then emits a row on the immediately following hydra_teleop.main
+- Detects run boundaries as: collect EVENTS up to ca_navigator.teleop STOP,
+  then emits a row on the immediately following ca_navigator.main
   {reached, elapsed, violations, energy_j, mean_power_w, compute_latency_us}.
 - Requires at least one EVENT in the run (otherwise no row).
 - CSV columns (order preserved):
@@ -21,10 +21,10 @@ import csv
 
 # ---------- Shape helpers ----------
 def _is_stop(rec: Dict[str, Any]) -> bool:
-    return rec.get("name") == "hydra_teleop.navigation.teleop" and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
+    return rec.get("name") == "ca_navigator.navigation.teleop" and isinstance(rec.get("msg"), dict) and rec["msg"].get("event") == "STOP"
 
 def _is_main_terminator(rec: Dict[str, Any]) -> bool:
-    if rec.get("name") != "hydra_teleop.main":
+    if rec.get("name") != "ca_navigator.main":
         return False
     msg = rec.get("msg")
     # Terminator keyed by reached & elapsed; other fields validated at emit-time.
@@ -148,21 +148,21 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
                     msg = rec.get("msg", {})
                     strategy = rec.get("strategy")
 
-                    # STRICT: pull final metrics from hydra_teleop.main
+                    # STRICT: pull final metrics from ca_navigator.main
                     try:
                         zone_violations = int(msg["violations"])
                     except Exception:
-                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing integer 'violations' at ts={ts}")
+                        raise ValueError(f"[log_transformer] ca_navigator.main terminator missing integer 'violations' at ts={ts}")
 
                     # Energy & power (convert to kJ / kW)
                     try:
                         energy_kj = float(msg["energy_j"]) / 1000.0
                     except Exception:
-                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing numeric 'energy_j' at ts={ts}")
+                        raise ValueError(f"[log_transformer] ca_navigator.main terminator missing numeric 'energy_j' at ts={ts}")
                     try:
                         mean_power_kw = float(msg["mean_power_w"]) / 1000.0
                     except Exception:
-                        raise ValueError(f"[log_transformer] hydra_teleop.main terminator missing numeric 'mean_power_w' at ts={ts}")
+                        raise ValueError(f"[log_transformer] ca_navigator.main terminator missing numeric 'mean_power_w' at ts={ts}")
 
                     # compute_latency_us: Orin NX cycle-model latency (µs) for this run's APE invocations
                     compute_latency_us = 0.0
@@ -193,7 +193,7 @@ def transform(cfg: TransformCfg) -> List[Dict[str, Any]]:
 
     # ---------- Assign per-cycle run tags ----------
     def assign_run_tags(rows: List[Dict[str, Any]]) -> None:
-        CYCLE_STRATS = {"APE1", "APE2", "APE3", "TROOP"}
+        CYCLE_STRATS = {"APE1", "APE2", "APE3", "CA"}
         seen: set = set()
         run_idx = 1
         for r in rows:

@@ -1,4 +1,4 @@
-# hydra_teleop/logging/async_logger.py
+# ca_navigator/logging/async_logger.py
 import logging
 import logging.handlers
 import queue
@@ -13,7 +13,7 @@ from datetime import datetime
 class AsyncLoggerCfg:
     def __init__(
         self,
-        logfile: str = "hydra.log",
+        logfile: str = "ca_navigator.log",
         max_bytes: int = 10 * 1024 * 1024,
         backup_count: int = 5,
         queue_maxsize: int = 2000,

@@ -5,7 +5,7 @@ import os
 @dataclass
 class TeleopConfig:
     # --- Run Options ---
-    simulation_runs = 100
+    simulation_runs = 10
     simulation_timeout = 200
     simulation_world_style = "city" #"perlin|city"
     # --- Sim / world ---
@@ -43,7 +43,7 @@ class TeleopConfig:
     # Analyzer output directory (plots + summaries will go here):
     analyzer_out_dir: str = "logs/results"
 
-    analyzer_strategies = ["APE1", "APE2", "APE3", "TROOP"]
+    analyzer_strategies = ["APE1", "APE2", "APE3", "CA"]
 
     # =======================
     # Generated Simulation & Algo Selector
@@ -62,7 +62,7 @@ class TeleopConfig:
     # Event Generator (B-style)
     # =======================
     # Topics
-    event_topic = "/hydra/event"
+    event_topic = "/ca_navigator/event"
     ros_pose_topic = "/model/drone1/pose/info"
 
     # -----------------------
@@ -87,7 +87,7 @@ class TeleopConfig:
     #   APE1 budget: 523ms  — APE1_sleep (523ms) < deadline_min (600ms) → 0% violations
     #   APE2 budget: 1343ms — APE2_sleep (1343ms) within [600ms, 3500ms] → ~61% violations
     #   APE3 budget: 2035ms — APE3_sleep (2035ms) within [600ms, 3500ms] → ~70% violations
-    #   TROOP: always falls back to APE1 → 0% violations, APE2/3 quality on ~39% of events
+    #   CA: always falls back to APE1 → 0% violations, APE2/3 quality on ~39% of events
     #
     # Physical grounding at v_max=15m/s:
     #   deadline_min=600ms → 9m   (obstacle at LiDAR safe_m boundary)

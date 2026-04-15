@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Hydra experiment runner:
+CANavigator experiment runner:
 - Spawns bridges (pose + ROS↔GZ)
 - Emits events
 - Generates no-fly zones & targets
-- Runs each navigator (APE1, APE2, APE3, TROOP) in a fresh sim
+- Runs each navigator (APE1, APE2, APE3, CA) in a fresh sim
 - Records results to CSV and (optionally) runs the analyzer
 
 Runs until cfg.simulation_runs "good runs" are collected (all strategies
@@ -29,7 +29,7 @@ from .tools.bridge import start_parameter_bridge
 from .tools.violations import add_violation_monitor_to_executor
 from .tools.energy_monitor import add_energy_monitor_to_executor
 from .tools.event_emitter import add_event_emitter_to_executor, EventCfg
-from .navigation.nav_algorithm_T import LidarTargetNavigatorTROOP
+from .navigation.nav_algorithm_T import LidarTargetNavigatorCA
 from .tools.rtf_monitor import RtfMonitor
 from .analysis.statistics_analyzer import run_analysis
 from .logging.async_logger import setup_async_logger, AsyncLoggerCfg
@@ -54,14 +54,14 @@ def _run_one_strategy(
     """
     nav = None
     try:
-        nav = LidarTargetNavigatorTROOP(ctrl, cfg, strategy_name,
-                                        # For TROOP, APE3 is selected only when deadline >= 2589ms.
+        nav = LidarTargetNavigatorCA(ctrl, cfg, strategy_name,
+                                        # For CA, APE3 is selected only when deadline >= 2589ms.
                                         # This is intentionally above the raw APE3 budget (2035ms)
                                         # to add a 554ms safety margin, shifting ~14% of events from
                                         # APE3 to APE2 (empirical tier split: APE1≈61%, APE2≈23%,
                                         # APE3≈16%). Solo APE1/2/3 strategies use default thresholds
                                         # (None → EventDecisionCfg defaults).
-                                        ape3_select_threshold_ms=2589 if strategy_name == "TROOP" else None)
+                                        ape3_select_threshold_ms=2589 if strategy_name == "CA" else None)
         nav.attach_to_executor(exec)
         reached, elapsed, latency_us, compute_energy_j, events_handled, \
             events_violated, events_violated_deadline, events_violated_preemptive = nav.go_to(
@@ -74,7 +74,7 @@ def _run_one_strategy(
             if nav is not None:
                 nav.shutdown()
         except Exception as e:
-            print(f"[hydra][WARN] {strategy_name} nav.shutdown() error: {e}")
+            print(f"[can][WARN] {strategy_name} nav.shutdown() error: {e}")
 
         # Stop the publish loop before any potential Gazebo reset/teardown.
         # Without this, the gz-transport publisher and the plugin destructor race to
@@ -82,7 +82,7 @@ def _run_one_strategy(
         try:
             ctrl.pause()
         except Exception as e:
-            print(f"[hydra][WARN] ctrl.pause() error: {e}")
+            print(f"[can][WARN] ctrl.pause() error: {e}")
 
 
 def main() -> None:
@@ -98,7 +98,7 @@ def main() -> None:
         json_format=True,
     )
     log_handle = setup_async_logger(logcfg)
-    logger = logging.getLogger("hydra_teleop.main")
+    logger = logging.getLogger("ca_navigator.main")
     print(f"\n=== [LOGGING INITIALIZED] ===")
 
     pose_node = None
@@ -252,7 +252,7 @@ def main() -> None:
                 arena_gen.run()
 
                 print(
-                    f"\n=== Hydra Experiment Run {run_idx} "
+                    f"\n=== CANavigator Experiment Run {run_idx} "
                     f"(attempt {attempt_idx}, fresh target & NFZ) ==="
                 )
 
@@ -269,9 +269,9 @@ def main() -> None:
                     rtf_mon = RtfMonitor(world_name="airport", interval_s=5.0)
                     rtf_mon.start()
 
-                    # Strategies (APE1/APE2/APE3/TROOP) — each run uses same event seed
+                    # Strategies (APE1/APE2/APE3/CA) — each run uses same event seed
                     for strategy_idx, strategy in enumerate(cfg.analyzer_strategies):
-                        print(f"\n=== Hydra Experiment Strategy {strategy} ===")
+                        print(f"\n=== CANavigator Experiment Strategy {strategy} ===")
 
                         # Teleport drone back to start before every strategy except the first
                         # (first strategy starts from the freshly booted Gazebo initial pose)
@@ -343,11 +343,11 @@ def main() -> None:
                         if rtf_mon is not None:
                             rtf_mon.stop()
                     except Exception as e:
-                        print(f"[hydra][WARN] rtf_mon.stop() error: {e}")
+                        print(f"[can][WARN] rtf_mon.stop() error: {e}")
                     try:
                         stop_sim(sim)
                     except Exception as e:
-                        print(f"[hydra][WARN] stop_sim error for attempt {attempt_idx}: {e}")
+                        print(f"[can][WARN] stop_sim error for attempt {attempt_idx}: {e}")
 
                 # --------- Post-strategy logic: success check + APE ordering ----------
                 if all_reached:
@@ -405,13 +405,13 @@ def main() -> None:
                 if emitter is not None:
                     emitter.stop()
             except Exception as e:
-                print(f"[hydra][WARN] emitter.stop() error: {e}")
+                print(f"[can][WARN] emitter.stop() error: {e}")
 
             try:
                 if ctrl is not None:
                     ctrl.stop()
             except Exception as e:
-                print(f"[hydra][WARN] ctrl.stop() error: {e}")
+                print(f"[can][WARN] ctrl.stop() error: {e}")
 
             try:
                 if pose_node is not None and exec is not None:
@@ -423,7 +423,7 @@ def main() -> None:
                     # depending on implementation, pose_node.close() may be a no-op
                     pose_node.close()
             except Exception as e:
-                print(f"[hydra][WARN] pose_node close/remove error: {e}")
+                print(f"[can][WARN] pose_node close/remove error: {e}")
 
             try:
                 if exec is not None:
@@ -440,13 +440,13 @@ def main() -> None:
                 if rosgz_bridge is not None:
                     rosgz_bridge.stop()
             except Exception as e:
-                print(f"[hydra][WARN] rosgz_bridge.stop() error: {e}")
+                print(f"[can][WARN] rosgz_bridge.stop() error: {e}")
 
             try:
                 if log_handle is not None:
                     log_handle.stop()
             except Exception as e:
-                print(f"[hydra][WARN] log_handle.stop() error: {e}")
+                print(f"[can][WARN] log_handle.stop() error: {e}")
     else:
         print(f"\n=== Simulations are 0, running in analysis mode only ===")
 

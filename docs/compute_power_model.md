@@ -1,8 +1,8 @@
-# HydraN Compute Power Model
+# CANavigator Compute Power Model
 
 ## Overview
 
-HydraN uses a **two-layer compute accounting architecture** that combines a
+CANavigator uses a **two-layer compute accounting architecture** that combines a
 cycle-accurate operation latency model (Layer 1) with a dynamic software power
 model tuned for the **NVIDIA Jetson Orin NX** (ARM Cortex-A78AE) (Layer 2).
 Each layer answers a different question:
@@ -146,9 +146,9 @@ compare(3 + 3·N)    3 bounds clamps  +  2N list-comp (isfinite + r>0)  +  N min
 For `N_FRONT = 20`: **≈ 383 µs per call** (at 2.0 GHz)
 For `N_GATE  =  8`: **≈ 185 µs per call** (at 2.0 GHz)
 
-### TROOP Parallel-Halt Execution Model
+### CA Parallel-Halt Execution Model
 
-TROOP launches APE1, APE2, and APE3 simultaneously. When the **selected** APE
+CA launches APE1, APE2, and APE3 simultaneously. When the **selected** APE
 finishes at time T_sel, all still-running APEs are halted. The total compute
 cost charged for one event is:
 
@@ -156,7 +156,7 @@ cost charged for one event is:
 cost = Σ min(latency[i], T_sel)   for each APE i in running_set
 ```
 
-**Worked examples (TROOP mode, Orin NX):**
+**Worked examples (CA mode, Orin NX):**
 
 | Selected APE | Calculation | Total |
 |---|---|---|
@@ -315,7 +315,7 @@ Derives that dynamic switching power scales as `f^α` where α empirically falls
 in the range 1.0–2.0 for modern CMOS, with 1.5 being a well-supported midpoint.
 The paper uses hardware performance counters to validate the frequency-dependent
 model against direct power measurements. Provides the theoretical basis for the
-`(f/f_base)^alpha` term in the HydraN model.
+`(f/f_base)^alpha` term in the CANavigator model.
 
 ---
 

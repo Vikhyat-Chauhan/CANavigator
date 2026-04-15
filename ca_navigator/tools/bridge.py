@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/bridge.py
+# ca_navigator/bridge.py
 import subprocess
 import threading
 from typing import Iterable, Optional, Sequence, Tuple, Union

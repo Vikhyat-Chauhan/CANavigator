@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hydra Plugin: Procedural No-Fly Zone Generator
+CANavigator Plugin: Procedural No-Fly Zone Generator
 Generates an SDF + metadata file representing restricted zones via Perlin noise.
 
 Simplified height model:
@@ -66,7 +66,7 @@ class NoFlyGenCfg:
 
 
 class NoFlyGenerator:
-    """Hydra tool plugin for generating no-fly zones procedurally (legacy height only)."""
+    """CANavigator tool plugin for generating no-fly zones procedurally (legacy height only)."""
 
     def __init__(self, teleop_cfg, gen_cfg: NoFlyGenCfg):
         self.teleop_cfg = teleop_cfg

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hydra_teleop/event_emitter.py — deterministic emission on flag
+# ca_navigator/event_emitter.py — deterministic emission on flag
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -11,7 +11,7 @@ from std_msgs.msg import String
 # Pose is only used in non-deterministic mode
 from geometry_msgs.msg import PoseStamped
 
-from hydra_teleop.config import TeleopConfig
+from ca_navigator.config import TeleopConfig
 
 # ----------------------------- Config -----------------------------
 @dataclass
@@ -21,7 +21,7 @@ class EventCfg:
     event_deterministic: bool = False
 
     # ---- Fixed defaults (not meant to be tuned) ----
-    topic: str = field(default="/hydra/event", init=False)
+    topic: str = field(default="/ca_navigator/event", init=False)
     dt_min_s: float = field(default=0.900, init=False)
     # Ensures minimum inter-arrival (900ms) > APE1 sleep (523ms) by 183ms,
     # guaranteeing APE1 resolves before any subsequent event arrives.
@@ -37,9 +37,9 @@ class EventCfg:
     #   long-deadline events (~30% of the distribution).
     # deadline_alpha = 0.85: deadlines span [600ms, 3500ms] with log-uniform dt
     #   in [0.900s, 4.0s]. Expected tier split (1M sample simulation):
-    #     APE1 wins (0.52s < d ≤ 1.73s): ~61% of TROOP resolutions
-    #     APE2 wins (1.73s < d ≤ 2.03s): ~9%  of TROOP resolutions
-    #     APE3 wins (d > 2.03s):          ~30% of TROOP resolutions
+    #     APE1 wins (0.52s < d ≤ 1.73s): ~61% of CA resolutions
+    #     APE2 wins (1.73s < d ≤ 2.03s): ~9%  of CA resolutions
+    #     APE3 wins (d > 2.03s):          ~30% of CA resolutions
     deadline_alpha: float = field(default=0.85, init=False)
     deadline_min_s: float = field(default=0.60, init=False)
     deadline_max_s: float = field(default=3.50, init=False)
@@ -80,7 +80,7 @@ class EventEmitter(Node):
 
     def __init__(self, teleop_cfg: TeleopConfig, gen_cfg: Optional[EventCfg] = None):
         super().__init__(
-            "hydra_event_emitter",
+            "can_event_emitter",
             parameter_overrides=[
                 rclpy.parameter.Parameter(
                     "use_sim_time",

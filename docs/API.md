@@ -1,39 +1,39 @@
 # API Reference
 
-Module-level documentation for all public classes, functions, and interfaces in the Hydra framework.
+Module-level documentation for all public classes, functions, and interfaces in the CANavigator framework.
 
 ---
 
 ## Table of Contents
 
-- [hydra_teleop.main](#hydra_teleopmain)
-- [hydra_teleop.config](#hydra_teleopconfig)
-- [hydra_teleop.navigation](#hydra_teleopnavigation)
+- [ca_navigator.main](#ca_navigatormain)
+- [ca_navigator.config](#ca_navigatorconfig)
+- [ca_navigator.navigation](#ca_navigatornavigation)
   - [nav_algorithm_T](#nav_algorithm_tpy)
   - [teleop](#teleoppy)
   - [transport](#transportpy)
-- [hydra_teleop.simulation](#hydra_teleopsimulation)
+- [ca_navigator.simulation](#ca_navigatorsimulation)
   - [sim](#simpy)
   - [physics](#physicspy)
   - [pose_republisher](#pose_republisherpy)
-- [hydra_teleop.tools](#hydra_teleoptools)
+- [ca_navigator.tools](#ca_navigatortools)
   - [event_emitter](#event_emitterpy)
   - [violations](#violationspy)
   - [energy_monitor](#energy_monitorpy)
   - [arena_generator_city](#arena_generator_citypy)
   - [arena_generator_perlin](#arena_generator_perlinpy)
   - [bridge](#bridgepy)
-- [hydra_teleop.logging](#hydra_teleoplogging)
+- [ca_navigator.logging](#ca_navigatorlogging)
   - [async_logger](#async_loggerpy)
-- [hydra_teleop.analysis](#hydra_teleopanalysis)
+- [ca_navigator.analysis](#ca_navigatoranalysis)
   - [statistics_analyzer](#statistics_analyzerpy)
   - [log_transformer](#log_transformerpy)
 
 ---
 
-## hydra_teleop.main
+## ca_navigator.main
 
-Entry point for the Hydra experiment framework.
+Entry point for the CANavigator experiment framework.
 
 ### `main() -> None`
 
@@ -50,7 +50,7 @@ Orchestrates the full experiment lifecycle:
 Runs a single navigation strategy within the currently running Gazebo instance.
 
 **Parameters:**
-- `strategy_name` (`str`): One of `"APE1"`, `"APE2"`, `"APE3"`, `"TROOP"`
+- `strategy_name` (`str`): One of `"APE1"`, `"APE2"`, `"APE3"`, `"CA"`
 - `ctrl` (`GzTeleop`): Velocity controller instance
 - `cfg` (`TeleopConfig`): Configuration
 - `exec` (`MultiThreadedExecutor`): ROS 2 executor
@@ -59,7 +59,7 @@ Runs a single navigation strategy within the currently running Gazebo instance.
 
 ---
 
-## hydra_teleop.config
+## ca_navigator.config
 
 ### `class TeleopConfig`
 
@@ -69,17 +69,17 @@ See [CONFIGURATION.md](CONFIGURATION.md) for the complete parameter reference.
 
 ---
 
-## hydra_teleop.navigation
+## ca_navigator.navigation
 
 ### nav_algorithm_T.py
 
-#### `class LidarTargetNavigatorTROOP`
+#### `class LidarTargetNavigatorCA`
 
 The primary navigation engine implementing deadline-aware APE selection with LiDAR-based obstacle avoidance.
 
 **Constructor:**
 ```python
-LidarTargetNavigatorTROOP(
+LidarTargetNavigatorCA(
     ctrl: GzTeleop,
     cfg: TeleopConfig,
     strategy: str,
@@ -89,8 +89,8 @@ LidarTargetNavigatorTROOP(
 
 - `ctrl`: Velocity controller for sending commands
 - `cfg`: Global configuration
-- `strategy`: Which planning mode to use (`"APE1"`, `"APE2"`, `"APE3"`, or `"TROOP"`)
-- `ape3_select_threshold_ms`: Override for the APE3 selection threshold; `None` uses `EventDecisionCfg` defaults. TROOP uses `2589` (APE3 budget + 554ms safety margin).
+- `strategy`: Which planning mode to use (`"APE1"`, `"APE2"`, `"APE3"`, or `"CA"`)
+- `ape3_select_threshold_ms`: Override for the APE3 selection threshold; `None` uses `EventDecisionCfg` defaults. CA uses `2589` (APE3 budget + 554ms safety margin).
 
 **Methods:**
 
@@ -172,7 +172,7 @@ GzVelPub(topic: str = "/model/drone1/cmd_vel")
 
 ---
 
-## hydra_teleop.simulation
+## ca_navigator.simulation
 
 ### sim.py
 
@@ -242,7 +242,7 @@ Factory function that creates a republisher node, adds it to the executor, and r
 
 ---
 
-## hydra_teleop.tools
+## ca_navigator.tools
 
 ### event_emitter.py
 
@@ -257,7 +257,7 @@ Configuration for event generation.
 
 #### `class EventEmitter`
 
-ROS 2 node that generates and publishes events on `/hydra/event`.
+ROS 2 node that generates and publishes events on `/ca_navigator/event`.
 
 **Methods:**
 
@@ -380,7 +380,7 @@ bridge.stop()
 
 ---
 
-## hydra_teleop.logging
+## ca_navigator.logging
 
 ### async_logger.py
 
@@ -405,7 +405,7 @@ Initialize the async logging system. Returns a handle with a `.stop()` method th
 
 ---
 
-## hydra_teleop.analysis
+## ca_navigator.analysis
 
 ### statistics_analyzer.py
 

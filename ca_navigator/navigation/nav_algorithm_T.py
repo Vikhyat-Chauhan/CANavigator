@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# TROOP (event-aware): default TROOP + Breadcrumbs + Safety shims + LiDAR-aware heading
+# CA (event-aware): default CA + Breadcrumbs + Safety shims + LiDAR-aware heading
 # + NFZ repulsion + jerk/accel caps + deadline-aware parallel APEs
 #
 # Public API:
-#   LidarTargetNavigatorTROOP.go_to(
+#   LidarTargetNavigatorCA.go_to(
 #       target_xyz=None, timeout_s=None
 #   ) -> (reached: bool, elapsed_s: float, total_latency_us: float,
 #          compute_energy_j: float, events_handled: int, events_violated: int,
@@ -18,9 +18,9 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-from hydra_teleop.navigation.teleop import GzTeleop
-from hydra_teleop.config import TeleopConfig
-from hydra_teleop.tools.orin_nx_cycle_model import OrinNxCycleMeter, latency_to_energy_j
+from ca_navigator.navigation.teleop import GzTeleop
+from ca_navigator.config import TeleopConfig
+from ca_navigator.tools.orin_nx_cycle_model import OrinNxCycleMeter, latency_to_energy_j
 import logging
 
 # ---------- small math ----------
@@ -105,7 +105,7 @@ class RiskCfg:
 
 @dataclass
 class EventDecisionCfg:
-    event_topic: str = "/hydra/event"
+    event_topic: str = "/ca_navigator/event"
     # APE planning budgets (ms) — derived from orin_nx_cycle_model.py.
     # budget_ms = APE_LATENCY_US[name] × DEADLINE_SCALE=1000
     # (1µs native Cortex-A78AE compute → 1ms effective budget under
@@ -124,7 +124,7 @@ class EventDecisionCfg:
     ape3_select_threshold_ms: int = 2035   # use APE3 when deadline >= this
 
     v_cap_frac: float = 0.75
-    selector_mode: str = "TROOP"
+    selector_mode: str = "CA"
     commit_hold_s: float = 0.9
 
     sudden_obj_radius_m: float = 1.2
@@ -150,7 +150,7 @@ class _PoseSub(Node):
 
 class _ScanSub(Node):
     def __init__(self, topic: str, *, callback_group=None):
-        super().__init__("hydra_nav_lidar")
+        super().__init__("can_nav_lidar")
         self._lock = threading.Lock()
         self._scan: Optional[LaserScan] = None
         self._t_last = 0.0
@@ -202,9 +202,9 @@ class _ScanSub(Node):
         return [r for r in msg.ranges[lo:hi+1] if math.isfinite(r) and r > 0.0]
 
 class _EventSub(Node):
-    """Subscribe to /hydra/event (std_msgs/String with JSON payload)."""
+    """Subscribe to /ca_navigator/event (std_msgs/String with JSON payload)."""
     def __init__(self, topic: str, *, callback_group=None):
-        super().__init__("hydra_event_sub")
+        super().__init__("can_event_sub")
         self._lock = threading.Lock()
         self._pending: Optional[Dict] = None
         self._t_last = 0.0
@@ -233,7 +233,7 @@ class _EventSub(Node):
             return v
 
 
-class LidarTargetNavigatorTROOP:
+class LidarTargetNavigatorCA:
     """
     Default navigator. When an event arrives, APE1/APE2/APE3 workers run in
     parallel; the selector picks the highest-quality plan that can finish before
@@ -242,7 +242,7 @@ class LidarTargetNavigatorTROOP:
     """
 
     # ------------------------------------------------------------------
-    # TROOP selection table (all values in seconds)
+    # CA selection table (all values in seconds)
     #
     #   deadline >= ape3_budget_s  →  wait for APE3  (best quality)
     #   deadline >= ape2_budget_s  →  wait for APE2
@@ -283,8 +283,8 @@ class LidarTargetNavigatorTROOP:
         drone_topic = drone_pose_topic or getattr(cfg, "ros_pose_topic", f"/model/{entity}/pose/info")
 
         self._cbg = ReentrantCallbackGroup()
-        self._node_drone  = _PoseSub(drone_topic, "lidar_hydra_nav_drone_pose", callback_group=self._cbg)
-        self._node_target = _PoseSub(target_pose_topic, "lidar_hydra_nav_target_pose", callback_group=self._cbg)
+        self._node_drone  = _PoseSub(drone_topic, "can_nav_drone_pose", callback_group=self._cbg)
+        self._node_target = _PoseSub(target_pose_topic, "can_nav_target_pose", callback_group=self._cbg)
         self._node_scan   = _ScanSub(self._ac.scan_topic, callback_group=self._cbg)
 
         self._edc = EventDecisionCfg()
@@ -690,7 +690,7 @@ class LidarTargetNavigatorTROOP:
               target_xyz: Optional[Tuple[float, float, float]] = None,
               timeout_s: Optional[float] = None) -> Tuple[bool, float, float, float, int, int, int, int]:
         if self._executor is None:
-            raise RuntimeError("TROOP navigator is not attached to an executor. Call attach_to_executor(executor) first.")
+            raise RuntimeError("CA navigator is not attached to an executor. Call attach_to_executor(executor) first.")
         rate = max(1.0, float(self._gc.rate_hz))
         dt = 1.0 / rate
         t_start = self._sim_time()
@@ -775,7 +775,7 @@ class LidarTargetNavigatorTROOP:
                     salvage_order = {"APE3": ["APE3", "APE2", "APE1"],
                                      "APE2": ["APE2", "APE1"],
                                      "APE1": ["APE1"]}.get(self._evt_winner, ["APE1"])
-                    if self._edc.selector_mode != "TROOP":
+                    if self._edc.selector_mode != "CA":
                         salvage_order = [self._edc.selector_mode]
                     chosen_curr = next(
                         ((n, ready_curr[n]) for n in salvage_order if n in ready_curr),
@@ -793,7 +793,7 @@ class LidarTargetNavigatorTROOP:
                         self._evt_clear()
 
                 # Determine winner APE for this event at intake time
-                if self._edc.selector_mode == "TROOP":
+                if self._edc.selector_mode == "CA":
                     winner = self._evt_winner_for_deadline(deadline_s)
                 else:
                     winner = self._edc.selector_mode  # forced single-APE mode
@@ -829,15 +829,15 @@ class LidarTargetNavigatorTROOP:
 
                     mode = self._edc.selector_mode
                     threads = []
-                    if mode in ("TROOP", "APE1"):
+                    if mode in ("CA", "APE1"):
                         threads.append(threading.Thread(
                             target=self._evt_plan_ape1,
                             args=(snap, self._edc.ape1_budget_ms), daemon=True))
-                    if mode in ("TROOP", "APE2"):
+                    if mode in ("CA", "APE2"):
                         threads.append(threading.Thread(
                             target=self._evt_plan_ape2,
                             args=(snap, self._edc.ape2_budget_ms), daemon=True))
-                    if mode in ("TROOP", "APE3"):
+                    if mode in ("CA", "APE3"):
                         threads.append(threading.Thread(
                             target=self._evt_plan_ape3,
                             args=(snap, self._edc.ape3_budget_ms), daemon=True))
@@ -913,7 +913,7 @@ class LidarTargetNavigatorTROOP:
                                       planner=winner_name,
                                       ready_t=prop["ready_t"])
                             _running = (["APE1", "APE2", "APE3"]
-                                        if self._edc.selector_mode == "TROOP"
+                                        if self._edc.selector_mode == "CA"
                                         else [winner_name])
                             self._cycle_meter.record_event(winner_name, _running)
                             self._evt_resolved = True
