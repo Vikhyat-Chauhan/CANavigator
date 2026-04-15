@@ -8,7 +8,7 @@
 
 # CANavigator
 
-**Heterogeneous, Yet Dynamic Resource Allocation for Autonomous Drones**
+**Based on my thesis on: Brain-Inspired Drone Navigation Using the Conflict Architecture**
 
 A high-fidelity drone navigation and benchmarking framework that evaluates **deadline-aware adaptive planning** under dynamic, event-driven constraints. CANavigator orchestrates thousands of reproducible simulation runs comparing multiple planning strategies (APE1/APE2/APE3/CA) in procedurally generated environments with real-time no-fly zones, LiDAR-based obstacle avoidance, and physics-accurate energy modeling.
 
