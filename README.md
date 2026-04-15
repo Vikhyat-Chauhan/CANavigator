@@ -30,7 +30,7 @@ A high-fidelity drone navigation and benchmarking framework that evaluates **dea
   - Results plot comparing APE strategies
 -->
 
-<p align="center">
+<p align="left">
   <img src="docs/screenshots/ezgif-22770adea7e2d06c.gif" width="48%" alt="Simulation">
   <!-- <img src="docs/screenshots/gazebo_perlin.png" width="48%" alt="Perlin-noise arena in Gazebo"> -->
 </p>
