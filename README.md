@@ -12,6 +12,9 @@
 
 A high-fidelity drone navigation and benchmarking framework that evaluates **deadline-aware adaptive planning** under dynamic, event-driven constraints. CANavigator orchestrates thousands of reproducible simulation runs comparing multiple planning strategies (APE1/APE2/APE3/CA) in procedurally generated environments with real-time no-fly zones, LiDAR-based obstacle avoidance, and physics-accurate energy modeling.
 
+This material is based upon work supported by the **National Science Foundation under Grant No. 2204780.** 
+Any opinions, findings, and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reflect the views of the National Science Foundation.
+
 ---
 
 ## Screenshots
